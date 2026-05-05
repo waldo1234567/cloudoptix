@@ -1,0 +1,52 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudOptix Cross-Account Access Role'
+
+Parameters:
+  PlatformAccountID:
+    Type: String
+    Description: 'The AWS Account ID of the CloudOptix Platform Account'
+  CloudOptixExternalID:
+    Type: String
+    Description: 'The External ID to be used when CloudOptix assumes this role'
+
+Resources:
+  CloudOptixCrossAccountRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: 'CloudOptixCrossAccountRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${PlatformAccountID}:root'
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref CloudOptixExternalID
+      Policies:
+        - PolicyName: 'CloudOptixReadOnlyAndOptimization'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'ec2:Describe*'
+                  - 'cloudwatch:GetMetricData'
+                  - 'rds:Describe*'
+                  - 'dynamodb:Describe*'
+                  - 'lambda:List*'
+                  #Additional read-only permissions for other services can be added here
+                Resource: '*'
+              - Effect: 'Allow'
+                Action:
+                  - 'ec2:StopInstances'
+                  - 'ec2:StartInstances'
+                  - 'ec2:DeleteVolume'
+                  - 'ec2:CreateSnapshot'
+                Resource: '*'
+
+Outputs:
+  RoleARN:
+    Description: 'The ARN of the CloudOptix Cross-Account Role'
+    Value: !GetAtt CloudOptixCrossAccountRole.Arn

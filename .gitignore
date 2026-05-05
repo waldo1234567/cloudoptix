@@ -1,0 +1,6 @@
+**/.terraform/
+/.vscode
+
+.env
+
+pycache/
