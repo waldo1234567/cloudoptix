@@ -1,0 +1,8 @@
+{ 
+  "PK": {"S": "TENANT#9734cae8-7021-70b5-a8c1-a21483603f66"}, 
+  "SK": {"S": "PROFILE"}, 
+  "TargetAccountId": {"S": "247448832186"}, 
+  "TargetRegion": {"S": "ap-northeast-1"}, 
+  "TenantRoleArn": {"S": "arn:aws:iam::247448832186:role/CloudOptix-Tenant-Deployment-Role"}, 
+  "ExternalId": {"S": "cloudoptix-ext-test-001"} 
+}

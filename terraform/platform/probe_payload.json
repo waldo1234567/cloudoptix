@@ -1,0 +1,13 @@
+{
+    "tenant_id": "9734cae8-7021-70b5-a8c1-a21483603f66",
+    "tenant_role_arn": "arn:aws:iam::247448832186:role/CloudOptix-Tenant-Deployment-Role",
+    "region": "ap-northeast-1",
+    "sns_topic_arn": "arn:aws:sns:ap-northeast-1:289835835123:CloudOptix-Critical-Alerts",
+    "external_id": "cloudoptix-ext-test-001",
+    "resource_id": "vol-0498383fb330e47f3",
+    "resource_type": "volume",
+    "rule_result": {
+        "action": "TIER_1_DELETE",
+        "system_tasks": []
+    }
+}

@@ -13,7 +13,7 @@ Resources:
   CloudOptixCrossAccountRole:
     Type: 'AWS::IAM::Role'
     Properties:
-      RoleName: 'CloudOptixCrossAccountRole'
+      RoleName: 'CloudOptix-Tenant-Deployment-Role'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -24,28 +24,8 @@ Resources:
             Condition:
               StringEquals:
                 sts:ExternalId: !Ref CloudOptixExternalID
-      Policies:
-        - PolicyName: 'CloudOptixReadOnlyAndOptimization'
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: 'Allow'
-                Action:
-                  - 'ec2:Describe*'
-                  - 'cloudwatch:GetMetricData'
-                  - 'rds:Describe*'
-                  - 'dynamodb:Describe*'
-                  - 'lambda:List*'
-                  #Additional read-only permissions for other services can be added here
-                Resource: '*'
-              - Effect: 'Allow'
-                Action:
-                  - 'ec2:StopInstances'
-                  - 'ec2:StartInstances'
-                  - 'ec2:DeleteVolume'
-                  - 'ec2:CreateSnapshot'
-                Resource: '*'
-
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AdministratorAccess'
 Outputs:
   RoleARN:
     Description: 'The ARN of the CloudOptix Cross-Account Role'

@@ -1,0 +1,54 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - echo "Installing Terraform..."
+      - curl -s -qL -o terraform.zip https://releases.hashicorp.com/terraform/1.8.0/terraform_1.8.0_linux_amd64.zip
+      - unzip -q terraform.zip
+      - mv terraform /usr/local/bin/
+      - terraform --version
+
+  pre_build:
+    commands:
+      - echo "Initializing Autonomous Deployment for Tenant ${TENANT_ID}"
+
+      - aws s3 cp s3://${CONFIG_BUCKET}/${CONFIG_KEY} ./main.tf
+
+      - echo "Assuming Tenant Execution Role..."
+      - CREDS=$(aws sts assume-role --role-arn ${TENANT_ROLE_ARN} --role-session-name CloudOptixIaC-${ACTION_ID} --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text)
+
+      - export AWS_ACCESS_KEY_ID=$(echo $CREDS | awk '{print $1}')
+      - export AWS_SECRET_ACCESS_KEY=$(echo $CREDS | awk '{print $2}')
+      - export AWS_SESSION_TOKEN=$(echo $CREDS | awk '{print $3}')
+
+      - |
+        cat <<EOF > backend.tf
+        terraform {
+          backend "s3" {
+            bucket = "${STATE_BUCKET}"
+            key    = "${TENANT_ID}/${RESOURCE_ID}/terraform.tfstate"
+            region = "${AWS_REGION}"
+          }
+        }
+        EOF
+
+      - terraform init -no-color
+
+  build:
+    commands:
+      - echo "Executing terraform apply..."
+      - terraform apply -auto-approve -no-color
+
+  post_build:
+    commands:
+      - unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+      - |
+        if [ $CODEBUILD_BUILD_SUCCEEDING -eq 1 ]; then
+          echo "Deployment Successful."
+        else
+          echo "Deployment Failed. Review Terraform logs."
+          exit 1
+        fi  
