@@ -31,7 +31,9 @@ resource "aws_iam_role_policy" "worker_lambda_permissions" {
         Effect = "Allow"
         Resource = [
           aws_sqs_queue.scan_queue.arn,
-          aws_sqs_queue.action_queue.arn
+          aws_sqs_queue.action_queue.arn,
+          aws_sqs_queue.graph_queue.arn,
+          aws_sqs_queue.metrics_queue.arn
         ]
       },
       {
@@ -60,6 +62,7 @@ resource "aws_lambda_function" "scanner" {
   environment {
     variables = {
       DYNAMODB_TABLE_NAME = aws_dynamodb_table.cloudoptix_table.name
+      GRAPH_QUEUE_URL = aws_sqs_queue.graph_queue.url
     }
   }
 }
@@ -76,6 +79,7 @@ resource "aws_lambda_function" "graph_builder" {
   environment {
     variables = {
       DYNAMODB_TABLE_NAME = aws_dynamodb_table.cloudoptix_table.name
+      METRICS_QUEUE_URL = aws_sqs_queue.metrics_queue.url
     }
   }
 }
@@ -91,6 +95,7 @@ resource "aws_lambda_function" "metrics_collector" {
   environment {
     variables = {
       DYNAMODB_TABLE_NAME = aws_dynamodb_table.cloudoptix_table.name
+      ACTION_QUEUE_URL = aws_sqs_queue.action_queue.url
     }
   }
 }
@@ -134,6 +139,33 @@ resource "aws_lambda_event_source_mapping" "scanner_sqs_trigger" {
   event_source_arn = aws_sqs_queue.scan_queue.arn
   function_name    = aws_lambda_function.scanner.arn
   batch_size       = 1
+}
+
+resource "aws_lambda_event_source_mapping" "graph_trigger" {
+  event_source_arn = aws_sqs_queue.graph_queue.arn
+  function_name    = aws_lambda_function.graph_builder.arn
+  batch_size       = 1
+}
+
+resource "aws_lambda_event_source_mapping" "metrics_trigger" {
+  event_source_arn = aws_sqs_queue.metrics_queue.arn
+  function_name    = aws_lambda_function.metrics_collector.arn
+  batch_size       = 1
+}
+
+
+
+resource "aws_iam_role_policy_attachment" "action_sqs_trigger" {
+  role       = aws_iam_role.worker_lambda_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole"
+}
+
+resource "aws_lambda_event_source_mapping" "action_queue_trigger" {
+  event_source_arn = aws_sqs_queue.action_queue.arn
+  function_name    = aws_lambda_function.probe_executor.arn
+  batch_size       = 1
+
+  depends_on = [aws_iam_role_policy_attachment.action_sqs_trigger]
 }
 
 resource "aws_cloudwatch_event_rule" "daily_orchestration" {

@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import boto3
@@ -12,6 +13,8 @@ logger.setLevel(logging.INFO)
 
 dynamodb = boto3.resource('dynamodb')
 TABLE_NAME = os.environ.get('DYNAMODB_TABLE_NAME', 'cloudoptix-core-table')
+sqs = boto3.client('sqs')
+METRICS_QUEUE_URL = os.environ.get('METRICS_QUEUE_URL', '')
 
 table = dynamodb.Table(TABLE_NAME) # type: ignore
 
@@ -66,7 +69,7 @@ def identify_production_anchors(resources: List[Dict[str, Any]], region: str, ro
             anchors.add(res_id)
             continue
         
-        if resource_type == 'db-instance' and meta.get('MultiAz') is True:
+        if resource_type == 'db-instance' and meta.get('MultiAZ') is True:
             anchors.add(res_id)
             continue
         
@@ -220,6 +223,12 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             UpdateExpression = "SET IsUnsafe = :val",
             ExpressionAttributeValues={':val': is_unsafe}
         )
+    
+    sqs.send_message(
+        QueueUrl=METRICS_QUEUE_URL,
+        MessageGroupId=tenant_id,
+        MessageBody=json.dumps({"tenant_id": tenant_id})
+    )
     
     return {
         "statusCode": 200,

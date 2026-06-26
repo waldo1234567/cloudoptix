@@ -25,7 +25,11 @@ def discover(tenant_id: str, account_id: str, region: str, role_arn: str, extern
             arn = f"arn:aws:ec2:{region}:{account_id}:natgateway/{nat_id}"
             
             tags = {tag['Key']: tag['Value'] for tag in nat.get('Tags', [])}
-            
+            eip_allocation_id = None
+            for addr in nat.get('NatGatewayAddresses', []):
+                if addr.get('AllocationId'):
+                    eip_allocation_id = addr['AllocationId']
+                    break
             res = Resource(
                 tenant_id=tenant_id,
                 account_id=account_id,
@@ -40,7 +44,8 @@ def discover(tenant_id: str, account_id: str, region: str, role_arn: str, extern
                     "SubnetId": nat['SubnetId'],
                     "State": nat['State'],
                     "ConnectivityType": nat.get('ConnectivityType', 'public'),
-                    "CreateTime": nat['CreateTime'].isoformat()
+                    "CreateTime": nat['CreateTime'].isoformat(),
+                    "EipAllocationId": eip_allocation_id
                 }
             )
             

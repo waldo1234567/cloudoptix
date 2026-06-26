@@ -1,6 +1,6 @@
 from typing import Dict, Any
 from .models import Action, Confidence, RuleResult
-from terraform.platform.src.lambdas.metrics.classfier import WorkloadPattern
+from src.lambdas.metrics.classfier import WorkloadPattern
 
 DOWNSIZE_MAP = {
     't3.medium': 't3.small', 't3.large': 't3.medium', 't3.xlarge': 't3.large',
@@ -48,7 +48,7 @@ def evaluate(resource: Dict[str, Any], metrics: Dict[str, Any],pattern: Workload
     
     if pattern == WorkloadPattern.ABANDONED:
         return RuleResult(
-            action=Action.TIER_1_DELETE,
+            action=Action.TIER_1_STOP,
             confidence=Confidence.HIGH,
             reasoning="Instance is mathematically abandoned. Executor will Stop the instance and monitor for health check failures.",
             blast_radius_assessment="LOW - Resource is isolated and inactive. Rollback probe attached.",
@@ -97,30 +97,54 @@ resource "aws_autoscaling_policy" "{res_id}_tracking" {{
         )
     
     if pattern == WorkloadPattern.SCHEDULED:
+        ami_id          = meta.get('ImageId', '<ami-id-from: terraform state list | grep ' + res_id + '>')
+        subnet_id       = meta.get('SubnetId', '')
+        security_groups = meta.get('SecurityGroups', [])
+        sg_ids          = [sg['GroupId'] for sg in security_groups]
+        sg_ids_str      = ', '.join(f'"{g}"' for g in sg_ids) if sg_ids else '# No security groups found in scanner'
+        
+        
         hcl_diff = f"""
 # Architectural Migration: Native AWS ASG Scheduling
-resource "aws_autoscaling_group" "{res_id}_scheduled_asg" {{
-  max_size = 1
-  min_size = 0
-  # Attach existing instance to ASG
+resource "aws_ami_from_instance" "{res_id}_backup" {{
+  name               = "{res_id}-scheduled-baseline"
+  source_instance_id = "{res_id}"
 }}
 
-resource "aws_autoscaling_schedule" "scale_up" {{
-  scheduled_action_name  = "business_hours_start"
-  min_size              = 1
-  max_size              = 1
-  desired_capacity      = 1
-  recurrence            = "0 8 * * MON-FRI" # 8 AM Monday-Friday
-  autoscaling_group_name = aws_autoscaling_group.{res_id}_scheduled_asg.name
+resource "aws_launch_template" "{res_id}_template" {{
+    name_prefix   = "{res_id}-"
+    image_id      = "{ami_id}"
+    instance_type = "{instance_type}"
+    vpc_security_group_ids = [{sg_ids_str}]
 }}
 
-resource "aws_autoscaling_schedule" "scale_down" {{
-  scheduled_action_name  = "business_hours_end"
-  min_size              = 0
-  max_size              = 0
-  desired_capacity      = 0
-  recurrence            = "0 18 * * MON-FRI" # 6 PM Monday-Friday
-  autoscaling_group_name = aws_autoscaling_group.{res_id}_scheduled_asg.name
+resource "aws_autoscaling_group" "{res_id}_asg" {{
+  vpc_zone_identifier = ["{subnet_id}"]
+  desired_capacity    = 1
+  max_size            = 1
+  min_size            = 0
+  
+  launch_template {{
+    id      = aws_launch_template.{res_id}_template.id
+    version = "$Latest"
+  }}
+}}
+resource "aws_autoscaling_schedule" "{res_id}_scale_down" {{
+  scheduled_action_name  = "scale-down-evening"
+  min_size               = 0
+  max_size               = 0
+  desired_capacity       = 0
+  recurrence             = "0 19 * * *"
+  autoscaling_group_name = aws_autoscaling_group.{res_id}_asg.name
+}}
+
+resource "aws_autoscaling_schedule" "{res_id}_scale_up" {{
+  scheduled_action_name  = "scale-up-morning"
+  min_size               = 1
+  max_size               = 1
+  desired_capacity       = 1
+  recurrence             = "0 8 * * *"
+  autoscaling_group_name = aws_autoscaling_group.{res_id}_asg.name
 }}
         """
         return RuleResult(
@@ -129,7 +153,8 @@ resource "aws_autoscaling_schedule" "scale_down" {{
             reasoning="Workload maps perfectly to business hours. Wrapping in an ASG with cron-based scaling automates shutdowns safely.",
             blast_radius_assessment="LOW - Wrapping a single instance in an ASG requires minimal configuration.",
             estimated_monthly_savings=current_cost * 0.65, # Saving ~65% by turning off nights and weekends
-            terraform_hcl_diff=hcl_diff.strip()
+            terraform_hcl_diff=hcl_diff.strip(),
+            system_tasks=[]
         )
     
     if pattern == WorkloadPattern.ALWAYS_ON_IDLE:
@@ -148,7 +173,7 @@ resource "aws_autoscaling_schedule" "scale_down" {{
         
         hcl_diff = f"""
         # Architectural Migration: Static Downsize
-resource "aws_instance" "<your_resource_name>" {{
+resource "aws_instance" "{res_id}" {{
 -  instance_type = "{instance_type}"
 +  instance_type = "{target_type}"
 }}

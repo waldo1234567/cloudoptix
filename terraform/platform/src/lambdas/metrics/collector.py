@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import boto3
@@ -11,7 +12,9 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 dynamodb = boto3.resource('dynamodb')
+sqs = boto3.client('sqs')
 TABLE_NAME = os.environ.get('DYNAMODB_TABLE_NAME', 'cloudoptix-core-table')
+ACTION_QUEUE_URL = os.environ.get('ACTION_QUEUE_URL', '')
 table = dynamodb.Table(TABLE_NAME)
 
 # Finalized Metric Registry for Deterministic Rule Evaluation
@@ -107,7 +110,7 @@ def build_metric_queries(resource_id: str, resource_type: str) -> List[Dict[str,
             'Id' : f"m_{query_idx}_p99",
             'MetricStat' : {
                 'Metric' : {
-                    'NameSpace' : metric['NameSpace'],
+                    'NameSpace' : metric['Namespace'],
                     'MetricName' : metric['MetricName'],
                     'Dimensions' : [{'Name': dim_key, 'Value' : resource_id}]
                 },
@@ -222,6 +225,12 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     ExpressionAttributeValues = {':val': metrics}
                 )                    
                 collected_count += 1
+    
+    sqs.send_message(
+        QueueUrl=ACTION_QUEUE_URL,
+        MessageGroupId=tenant_id,
+        MessageBody=json.dumps({"tenant_id": tenant_id})
+    )
     
     return {
         "statusCode": 200,

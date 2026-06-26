@@ -41,6 +41,15 @@ def discover(tenant_id: str, account_id: str, region:str, role_arn:str, external
                         "LaunchTime": instance['LaunchTime'].isoformat(),
                         "VpcId": instance.get('VpcId'),
                         "SubnetId": instance.get('SubnetId')
+                        "ImageId": instance.get('ImageId'),
+                        "SecurityGroups" : [
+                            {"GroupId": sg['GroupId'], "GroupName": sg['GroupName']}
+                            for sg in instance.get('SecurityGroups', [])
+                        ],
+                        "BlockDeviceMappings":[
+                            {"DeviceName": bdm['DeviceName'], "VolumeId": bdm.get('Ebs', {}).get('VolumeId')}
+                            for bdm in instance.get('BlockDeviceMappings', [])
+                        ]
                     }
                 )
                 

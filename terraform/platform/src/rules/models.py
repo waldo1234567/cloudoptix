@@ -3,11 +3,13 @@ from typing import Dict, Any, List, Optional
 from enum import Enum
 
 class Action(Enum):
-    TIER_1_DELETE="TIER_1_DELETE"
-    TIER_2_SQUEEZE="TIER_2_SQUEEZE"
-    TIER_3_IAC = "TIER_3_IAC"
-    RECOMMEND = "RECOMMEND"
-    IGNORE = "IGNORE"
+    TIER_1_STOP   = "TIER_1_STOP"    
+    TIER_1_DELETE = "TIER_1_DELETE"  
+    TIER_1_RELEASE = "TIER_1_RELEASE" 
+    TIER_2_SQUEEZE = "TIER_2_SQUEEZE"
+    TIER_3_IAC    = "TIER_3_IAC"
+    RECOMMEND     = "RECOMMEND"
+    IGNORE        = "IGNORE"
     
 class Confidence(Enum):
     HIGH = "HIGH"

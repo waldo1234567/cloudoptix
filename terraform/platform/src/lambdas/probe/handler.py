@@ -2,10 +2,10 @@ import time
 import json
 import boto3
 import logging
-from typing import Dict, Any, List
+import urllib.request
+from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
 from botocore.exceptions import ClientError, WaiterError
-
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -15,6 +15,7 @@ class ExecutionEngine:
         self.tenant_id = tenant_id
         self.region = region
         self.sns_topic_arn = sns_topic_arn
+        self.tenant_role_arn = tenant_role_arn
         
         sts_client = boto3.client('sts')
         try:
@@ -34,6 +35,7 @@ class ExecutionEngine:
             }
             
             self.ec2 = boto3.client('ec2', **tenant_session)
+            self.rds = boto3.client('rds', **tenant_session)
             self.backup = boto3.client('backup', **tenant_session)
             self.cloudwatch = boto3.client('cloudwatch', **tenant_session)
             
@@ -43,162 +45,302 @@ class ExecutionEngine:
             logger.critical(f"STS Authentication failed for Tenant {tenant_id}: {e}")
             raise Exception("Authentication Failure. Cannot execute actions.")
         
-    
+        self.ACTION_REGISTRY = {
+            'TIER_1_STOP':    self._handle_tier_1_stop,
+            'TIER_1_DELETE':  self._handle_tier_1_delete,
+            'TIER_1_RELEASE': self._handle_tier_1_release,
+            'TIER_3_IAC':     self._handle_tier_3_iac,
+        }
+        
     def execute_rule_result(self, resource_id: str, resource_type: str, rule_result: Dict[str, Any])-> Dict[str, Any]:
         action = rule_result.get('action')
         tasks = rule_result.get('system_tasks', [])
         
-        if action == 'TIER_3_IAC':
-            logger.info(f"[{resource_id}] Tier 3 Action. IaC generation only. No execution required.")
-            return {"status": "SUCCESS", "message": "IaC generated and queued for tenant approval."}
-    
+        task_state = {}
         if tasks:
-            self._execute_system_tasks(tasks, tenant_role_arn=rule_result.get('backup_role_arn')) # type: ignore
+            task_state = self._execute_system_tasks(tasks, resource_id)
+            if task_state.get('status') == 'FAILED': # type: ignore
+                logger.error(f"Pre-flight task failed for {resource_id}. Aborting execution.")
+                return task_state
+        
+        handler = self.ACTION_REGISTRY.get(action)
+        if not handler:
+            msg = f"No execution handler registered for action: {action}"
+            logger.error(msg)
+            return {"status": "FAILED", "message": msg}
+
+        return handler(resource_id, resource_type, rule_result, task_state)
+
+    def _poll_with_timeout(self, check_fn, pass_condition_fn, timeout_seconds: int = 300 , interval_seconds: int = 15, context:str = "") -> bool:
+        attempts = timeout_seconds // interval_seconds
+        for attempt in range(attempts):
+            try:
+                result = check_fn()
+                if pass_condition_fn(result):
+                    logger.info(f"Probe PASSED on attempt {attempt + 1}. Context: {context}")
+                    return True
+            except Exception as e:
+                logger.warning(f"Probe attempt {attempt + 1} error: {e}. Context: {context}")
+            time.sleep(interval_seconds)
+        logger.error(f"Probe TIMEOUT after {timeout_seconds}s. Context: {context}")
+        return False
+    
+    def _synthetic_http_probe(self, endpoint_url: str) -> bool:
+        logger.info(f"Initiating synthetic HTTP probe: {endpoint_url}")
+        for attempt in range(20):
+            try:
+                req = urllib.request.Request(endpoint_url, method="GET")
+                with urllib.request.urlopen(req, timeout = 5) as response:
+                    if response.status in [200, 201, 202]:
+                        logger.info("Probe SUCCESS.")
+                        return True
             
-        if action == 'TIER_1_STOP' and resource_type == 'instance':
-            return self._handle_ec2_stop_with_rollback(resource_id)
-
-        elif action == 'TIER_1_DELETE' and resource_type == 'volume':
-            return self._handle_ebs_delete(resource_id)
-        
-        return {"status": "IGNORED", "message": "No actionable Tier 1 command recognized."}
-
-    def _execute_system_tasks(self, tasks: List[Dict[str, Any]], tenant_role_arn: str):
+            except Exception as e:
+                logger.warning(f"Probe attempt {attempt + 1} failed: {e}")
+            time.sleep(15)
+        logger.error("Probe TIMEOUT.")
+        return False
+    
+    def _execute_system_tasks(self, tasks: List[Dict[str, Any]], resource_id: str) -> Dict[str, Any]:
+        state = {"status": "SUCCESS"}
         for task in tasks:
-            if task.get('type') == 'START_BACKUP_JOB':
-                res_arn = task.get('resource_id')
-                vault = task.get('vault_name')
-                
+            task_type = task.get('type')
+            
+            if task_type in ['START_BACKUP_JOB', 'CREATE_SNAPSHOT']:
+                vol_id = task.get('volume_id', resource_id)
                 try:
-                    logger.info(f"Starting AWS Backup job for {res_arn} into {vault}")
-                    response = self.backup.start_backup_job(
-                        BackupVaultName=vault,
-                        ResourceArn=res_arn,
-                        IamRoleArn=tenant_role_arn
-                    )
-                    job_id = response.get('BackupJobId')
+                    logger.info(f"Creating pre-flight snapshot for volume {vol_id}")
+                    snap = self.ec2.create_snapshot(VolumeId=vol_id, Description=f"CloudOptix Auto-Backup {vol_id}")
+                    snap_id = snap['SnapshotId']
+
+                    waiter = self.ec2.get_waiter('snapshot_completed')
+                    waiter.wait(SnapshotIds=[snap_id], WaiterConfig={'Delay': 15, 'MaxAttempts': 40})
                     
-                    timeout = time.time() + 60
+                    state['snapshot_id'] = snap_id
+                    logger.info(f"Snapshot {snap_id} verified complete.")
                     
-                    while time.time() < timeout:
-                        job_status = self.backup.describe_backup_job(BackupJobId=job_id)
-                        state = job_status.get('State')
-                        if state in ['RUNNING', 'COMPLETED']:
-                            break
-                        elif state in ['FAILED', 'ABORTED']:
-                            raise Exception(f"Backup job {job_id} failed with state: {state}")
-                        time.sleep(5)
-                    
-                except ClientError as e:
-                    logger.error(f"Backup task failed for {res_arn}: {e}")
-                    raise Exception("Pre-flight safety task failed. Action aborted.")
-        
-    def _handle_ec2_stop_with_rollback(self, instance_id: str) -> Dict[str,Any]:
-        logger.info(f"[{instance_id}] Initiating Tier 1 Stop.")
-        
-        action_timestamp = datetime.now(timezone.utc)
-        
+                except Exception as e:
+                    logger.error(f"Pre-flight snapshot failed: {e}")
+                    return {"status": "FAILED", "message": str(e)}
+        return state
+    
+    def _handle_tier_3_iac(self, resource_id: str, resource_type: str, rule_result: Dict, task_state: Dict) -> Dict:
+        return {"status": "SUCCESS", "message": "IaC generated successfully."}
+    
+    def _handle_tier_1_delete(self, resource_id: str, resource_type: str, rule_result: Dict, task_state: Dict) -> Dict:
+        if resource_type == 'volume':
+            return self._delete_ebs_volume(resource_id, task_state)
+        elif resource_type == 'natgateway':
+            return self._delete_nat_gateway(resource_id)
+        else:
+            return {"status": "FAILED", "message": f"TIER_1_DELETE not supported for resource_type={resource_type}."}
+    
+    def _handle_tier_1_stop(self, resource_id: str, resource_type: str, rule_result: Dict, task_state: Dict) -> Dict:
+        if resource_type != 'instance': return {"status": "FAILED", "message": "Stop requires instance."}
+        logger.info(f"[{resource_id}] Initiating TIER_1_STOP.")
         try:
-            self.ec2.stop_instances(InstanceIds=[instance_id])
+            self.ec2.stop_instances(InstanceIds=[resource_id])
             
             waiter = self.ec2.get_waiter('instance_stopped')
-            waiter.wait(InstanceIds=[instance_id], WaiterConfig={'Delay': 15, 'MaxAttempts': 40})
+            waiter.wait(InstanceIds=[resource_id], WaiterConfig={'Delay': 15, 'MaxAttempts': 20})
             
-            time.sleep(180)
-            
-            triggered_alarms =  self._probe_environment_health(action_timestamp)
-            
-            if triggered_alarms:
-                logger.warning(f"[{instance_id}] PROBE FAILED. {len(triggered_alarms)} alarms triggered.")
-                
-                return self._trigger_rollback(
-                    instance_id, 
-                    reason=f"Environment instability detected. Triggered Alarms: {', '.join(triggered_alarms)}"
-                )
-            
-            return {"status": "SUCCESS", "message": "Instance stopped safely. Environment is stable."}
-        
-        except WaiterError as we:
-            logger.error(f"Instance {instance_id} failed to stop cleanly: {we}")
-            return self._trigger_rollback(instance_id, "Instance state transition timeout.")
-        
+            logger.info(f"[{resource_id}] Instance stopped successfully.")
+            return {"status": "STOPPED", "message": f"Instance {resource_id} stopped."}
+
+        except WaiterError:
+            return self._rollback_ec2_stop(resource_id, rule_result.get('validation_endpoint'), "Instance failed to reach STOPPED state within 5 minutes.")
         except Exception as e:
-            logger.error(f"Execution error for {instance_id}: {e}")
-            return self._trigger_rollback(instance_id, f"Unexpected Execution Exception: {str(e)}")
+            return self._rollback_ec2_stop(resource_id, rule_result.get('validation_endpoint'), str(e))
         
-    
-    def _probe_environment_health(self, action_timestamp: datetime) -> List[str]:
-        triggered_alarms = []
-        paginator = self.cloudwatch.get_paginator('describe_alarms')
-        
-        
-        try:
-            for page in paginator.paginate(StateValue='ALARM'):
-                for alarm in page.get('MetricAlarms', []):
-                    updated_at = alarm.get('StateUpdatedTimestamp')
-                    
-                    if updated_at and updated_at >= action_timestamp:
-                        triggered_alarms.append(alarm.get('AlarmName'))
-        
-        except ClientError as e:
-            logger.error(f"Failed to query CloudWatch metrics: {e}")
-            triggered_alarms.append("CLOUDWATCH_PROBE_FAILURE")
-            
-        return triggered_alarms
-    
-    
-    def _handle_ebs_delete(self, volume_id: str) -> Dict[str, Any]:
-        try:
-            self.ec2.delete_volume(VolumeId=volume_id)
-            return {"status": "SUCCESS", "message": "Orphaned volume deleted."}
-        except ClientError as e:
-            logger.error(f"Failed to delete volume {volume_id}: {e}")
-            return {"status": "FAILED", "message": str(e)}
-    
-    def _trigger_rollback(self, instance_id: str, reason: str) -> Dict[str,Any]:
-        logger.error(f"[{instance_id}] EXECUTING ROLLBACK. Reason: {reason}")
-        
+    def _rollback_ec2_stop(self, instance_id: str, validation_url: Optional[str], reason: str) -> Dict[str, Any]:
+        logger.warning(f"ROLLBACK EC2: {instance_id}. Reason: {reason}")
         try:
             self.ec2.start_instances(InstanceIds=[instance_id])
-            
             waiter = self.ec2.get_waiter('instance_running')
             waiter.wait(InstanceIds=[instance_id], WaiterConfig={'Delay': 15, 'MaxAttempts': 40})
             
-            alert_payload = {
-                "event_type": "AUTONOMOUS_ROLLBACK",
-                "severity": "CRITICAL",
-                "tenant_id": self.tenant_id,
-                "resource_id": instance_id,
-                "action_attempted": "TIER_1_STOP",
-                "rollback_reason": reason,
-                "timestamp": datetime.now(timezone.utc).isoformat()
-            }
+            if validation_url:
+                if not self._synthetic_http_probe(validation_url):
+                    self._trigger_sns_escalation(
+                        instance_id, "ROLLBACK_DEGRADED",
+                        f"Instance restarted but HTTP probe failed. Original stop reason: {reason}"
+                    )
+                    return {"status": "ROLLBACK_DEGRADED", "message": "Instance running but application health check failed."}
             
-            self.sns.publish(
-                TopicArn=self.sns_topic_arn,
-                Subject=f"CloudOptix Rollback: Tenant {self.tenant_id}",
-                Message=json.dumps(alert_payload)
+            self._trigger_sns_escalation(instance_id, "TIER_1_STOP", reason)
+            return {"status": "ROLLED_BACK", "message": f"Reversed. {reason}"}
+        except Exception as e:
+            return {"status": "ROLLBACK_FAILED", "message": str(e)}
+    
+    def _delete_ebs_volume(self, volume_id: str, task_state: Dict) -> Dict[str, Any]:
+        snapshot_id = task_state.get('snapshot_id')
+        if not snapshot_id:
+            return {"status": "FAILED", "message": "Pre-flight snapshot not verified. Aborting delete to protect data."}
+ 
+        try:
+            self.ec2.delete_volume(VolumeId=volume_id)
+            logger.info(f"[{volume_id}] Volume deleted. Backup: {snapshot_id}.")
+            return {"status": "DELETED", "message": f"Volume {volume_id} deleted. Backup verified in snapshot {snapshot_id}."}
+        except ClientError as e:
+            self._trigger_sns_escalation(
+                volume_id, "TIER_1_DELETE_FAILED",
+                f"Delete failed — volume still intact. Backup available at {snapshot_id}. Error: {str(e)}"
+            )
+            return {"status": "ESCALATED", "message": f"Delete failed. Volume still intact. Backup at {snapshot_id}."}
+    
+    def _delete_nat_gateway(self, nat_id: str) -> Dict[str, Any]:
+        try:
+            self.ec2.delete_nat_gateway(NatGatewayId=nat_id)
+            logger.info(f"[{nat_id}] Delete request issued. Polling for confirmation.")
+            
+            passed = self._poll_with_timeout(
+                check_fn=lambda: self.ec2.describe_nat_gateways(NatGatewayIds=[nat_id])['NatGateways'][0]['State'],
+                pass_condition_fn=lambda state: state == 'deleted',
+                timeout_seconds=300,
+                context=f"NAT Gateway {nat_id} deletion"
             )
             
-            return {"status": "ROLLED_BACK", "message": f"Action reversed. {reason}"}
-
-        except Exception as e:
-            logger.critical(f"FATAL ROLLBACK FAILURE for {instance_id}: {e}")
-            return {"status": "ROLLBACK_FAILED", "message": f"System state corrupted. Error: {e}"}
+            if passed:
+                logger.info(f"[{nat_id}] NAT Gateway confirmed deleted.")
+                return {"status": "DELETED", "message": f"NAT Gateway {nat_id} deleted. Saving ~$32.50/month."}
+            else:
+                self._trigger_sns_escalation(
+                    nat_id, "NAT_DELETE_TIMEOUT",
+                    "NAT Gateway delete issued but did not confirm 'deleted' state within 300s. Verify manually."
+                )
+                return {"status": "ESCALATED", "message": "Delete issued but state confirmation timed out. Manual verification required."}
         
+        except ClientError as e:
+            self._trigger_sns_escalation(nat_id, "NAT_DELETE_FAILED", str(e))
+            return {"status": "FAILED", "message": str(e)}
+        
+    def _handle_tier_1_release(self, resource_id: str, resource_type: str, rule_result: Dict, task_state: Dict) -> Dict:
+        if resource_type != 'eip':
+            return {"status": "FAILED", "message": f"TIER_1_RELEASE requires resource_type=eip, got {resource_type}."}
+        
+        try:
+            self.ec2.release_address(AllocationId = resource_id)
+            logger.info(f"[{resource_id}] EIP released successfully.")
+            return {"status": "RELEASED", "message": f"EIP {resource_id} released. No rollback possible — action is irreversible."}
+
+        except ClientError as e:
+            error_code = e.response['Error']['Code']
+            if error_code == 'AuthFailure':
+                return {"status": "FAILED", "message": "Insufficient permissions to release EIP."}
+            if error_code ==  'InvalidAllocationID.NotFound':
+                return {"status": "SKIPPED", "message": "EIP no longer exists — may have been released manually."}
+            self._trigger_sns_escalation(resource_id, "EIP_RELEASE_FAILED", str(e))
+            return {"status": "FAILED", "message": str(e)}
     
+    def _handle_rds_stop(self, db_instance_id: str, rule_result: Dict) -> Dict[str,Any]:
+        logger.info(f"[{db_instance_id}] Initiating RDS stop.")
+        
+        try:
+            self.rds.stop_db_instance(DBInstanceIdentifier=db_instance_id)
+            
+            passed = self._poll_with_timeout(
+                check_fn=lambda: self.rds.describe_db_instances(DBInstanceIdentifier=db_instance_id)['DBInstances'][0]['DBInstanceStatus'],
+                pass_condition_fn=lambda status: status == 'stopped',
+                timeout_seconds=600,
+                context=f"RDS stop {db_instance_id}"
+            )
+            
+            if passed:
+                logger.info(f"[{db_instance_id}] RDS instance stopped successfully.")
+                return {"status": "STOPPED", "message": f"RDS instance {db_instance_id} stopped and confirmed."}
+            else:
+                return self._rollback_rds_stop(db_instance_id, "RDS instance failed to reach stopped state within 10 minutes.")
+        except ClientError as e:
+            return self._rollback_rds_stop(db_instance_id, str(e))
+    
+    def _rollback_rds_stop(self, db_instance_id: str, reason: str) -> Dict[str,Any]:
+        logger.warning(f"[{db_instance_id}] ROLLBACK RDS STOP. Reason: {reason}")
+        
+        try:
+            self.rds.start_db_instance(DBInstanceIdentifier=db_instance_id)
+            
+            self._poll_with_timeout(
+                check_fn=lambda: self.rds.describe_db_instances(DBInstanceIdentifier=db_instance_id)['DBInstances'][0]['DBInstanceStatus'],
+                pass_condition_fn=lambda status: status == 'available',
+                timeout_seconds=600,
+                context=f"RDS rollback start {db_instance_id}"
+            )
+            
+            passed = self._poll_with_timeout(
+                 check_fn=lambda: self.cloudwatch.get_metric_statistics(
+                    Namespace='AWS/RDS',
+                    MetricName='DatabaseConnections',
+                    Dimensions=[{'Name': 'DBInstanceIdentifier', 'Value': db_instance_id}],
+                    StartTime=datetime.now(timezone.utc).__class__.utcnow().__class__.utcnow(),
+                    EndTime=datetime.now(timezone.utc),
+                    Period=60,
+                    Statistics=['Maximum']
+                ).get('Datapoints', []),
+                pass_condition_fn=lambda points: any(p.get('Maximum', 0) > 0 for p in points),
+                timeout_seconds=600,
+                context=f"RDS connection probe {db_instance_id}"
+            )
+
+            if not passed:
+                self._trigger_sns_escalation(
+                    db_instance_id, "RDS_ROLLBACK_DEGRADED",
+                    f"RDS restarted but no connections re-established within 10 minutes. Original reason: {reason}"
+                )
+                return {"status": "ROLLBACK_DEGRADED", "message": "RDS running but no connections confirmed."}
+
+            self._trigger_sns_escalation(db_instance_id, "RDS_STOP_ROLLED_BACK", reason)
+            return {"status": "ROLLED_BACK", "message": f"RDS stop reversed. Reason: {reason}"}
+        
+        except Exception as e:
+            self._trigger_sns_escalation(db_instance_id, "RDS_ROLLBACK_FAILED", f"CRITICAL: {e}")
+            return {"status": "ROLLBACK_FAILED", "message": str(e)}
+    
+    
+    
+    def _trigger_sns_escalation(self, resource_id: str, event_type: str, reason: str):
+        payload = {
+            "event":       event_type,
+            "severity":    "CRITICAL",
+            "tenant_id":   self.tenant_id,
+            "resource_id": resource_id,
+            "reason":      reason,
+            "timestamp":   datetime.now(timezone.utc).isoformat()
+        }
+        try:
+            self.sns.publish(
+                TopicArn=self.sns_topic_arn,
+                Subject=f"CloudOptix Escalation: {event_type}",
+                Message=json.dumps(payload)
+            )
+        except Exception as e:
+             logger.critical(f"SNS escalation FAILED for {resource_id}: {e}. Original event: {event_type} — {reason}")
+
+def _route_tier_1_stop(engine: 'ExecutionEngine', resource_id: str, resource_type: str, rule_result: Dict, task_state: Dict) -> Dict:
+    if resource_type == 'instance':
+        return engine._handle_tier_1_stop(resource_id, resource_type, rule_result, task_state)
+    elif resource_type == 'db-instance':
+        return engine._handle_rds_stop(resource_id, rule_result)
+    else:
+        return {"status": "FAILED", "message": f"TIER_1_STOP not supported for resource_type={resource_type}."}
+
     
 def lambda_handler(event, context):
-    engine = ExecutionEngine(
-        tenant_id=event['tenant_id'],
-        tenant_role_arn=event['tenant_role_arn'],
-        region=event['region'],
-        sns_topic_arn=event['sns_topic_arn'],
-        external_id=event.get('external_id', 'cloudoptix-ext-test-001')
-    )
-    
-    return engine.execute_rule_result(
-        resource_id=event['resource_id'],
-        resource_type=event['resource_type'],
-        rule_result=event['rule_result']
-    )
+    try:
+        engine = ExecutionEngine(
+            tenant_id=event['tenant_id'],
+            tenant_role_arn=event['tenant_role_arn'],
+            region=event['region'],
+            sns_topic_arn=event['sns_topic_arn'],
+            external_id=event.get('external_id', 'cloudoptix-ext-test-001')
+        )
+        
+        resource_id   = event['resource_id']
+        resource_type = event['resource_type']
+        rule_result   = event.get('rule_result', {})
+        
+        engine.ACTION_REGISTRY['TIER_1_STOP'] = lambda rid, rtype, rr, ts: _route_tier_1_stop(engine, rid, rtype, rr, ts) # type: ignore
+ 
+        return engine.execute_rule_result(resource_id, resource_type, rule_result)
+    except Exception as e:
+        logger.error(f"Probe Lambda crashed: {e}", exc_info=True)
+        return {"status": "ERROR", "message": str(e)}

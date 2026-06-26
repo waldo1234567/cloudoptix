@@ -14,32 +14,37 @@ def evaluate(resource: Dict[str, Any], metrics: Dict[str, Any], pattern: Workloa
         return RuleResult(Action.IGNORE, Confidence.HIGH, "NAT Gateway is not in available state.", "SAFE", 0.0)
     
     if pattern == WorkloadPattern.ABANDONED:
-        route_cleanup_hcl = ""
-        for rt_id in associated_route_tables:
-            route_cleanup_hcl += f"- resource \"aws_route\" \"{rt_id}_nat_route\" {{ ... }}\n"
-
-        endpoint_context = (
-            "VPC Endpoints are already provisioned in this VPC. No loss of AWS API access." 
-            if vpc_endpoints_present 
-            else "If instances require AWS API access (e.g., S3), provision VPC Endpoints before applying."
-        )
-
-        hcl_diff = f"""
-# Architectural Migration: Eradicate Abandoned NAT Gateway
+        if associated_route_tables:
+            endpoint_context = (
+                "VPC Endpoints are already provisioned in this VPC. No loss of AWS API access."
+                if vpc_endpoints_present
+                else "Provision VPC Endpoints before applying if instances require AWS API access (S3, DynamoDB)."
+            )
+            
+            hcl_diff = f"""
+# Architectural Migration: Remove Abandoned NAT Gateway
 # Context: {endpoint_context}
-
-{route_cleanup_hcl}
+# Route tables referencing this NAT must be updated first:
+{"".join(f'# - {rt_id}{chr(10)}' for rt_id in associated_route_tables)}
 - resource "aws_nat_gateway" "{nat_id}" {{ ... }}
 - resource "aws_eip" "{nat_id}_eip" {{ ... }}
-        """
+            """
+
+            return RuleResult(
+                action=Action.TIER_3_IAC,
+                confidence=Confidence.HIGH,
+                reasoning=f"NAT Gateway has zero traffic but {len(associated_route_tables)} route table(s) still reference it. Manual route cleanup required before deletion.",
+                blast_radius_assessment="MEDIUM - Active route table references must be removed first.",
+                estimated_monthly_savings=32.50,
+                terraform_hcl_diff=hcl_diff.strip()
+            )
         
         return RuleResult(
-            action=Action.TIER_3_IAC,
+            action=Action.TIER_1_DELETE,
             confidence=Confidence.HIGH,
-            reasoning=f"NAT Gateway is orphaned (0 bytes). Generating complete cleanup IaC including {len(associated_route_tables)} Route Tables.",
-            blast_radius_assessment="MEDIUM - Modifies subnet routing. Safe due to 0 byte metric confirmation.",
-            estimated_monthly_savings=32.50,
-            terraform_hcl_diff=hcl_diff.strip()
+            reasoning="NAT Gateway has zero bytes and zero connections over 30 days with no route table dependencies. Safe for autonomous deletion.",
+            blast_radius_assessment="LOW - No route dependencies confirmed. $32.50/month waste eliminated.",
+            estimated_monthly_savings=32.50
         )
 
     return RuleResult(Action.IGNORE, Confidence.HIGH, "NAT Gateway is actively routing traffic.", "SAFE", 0.0)

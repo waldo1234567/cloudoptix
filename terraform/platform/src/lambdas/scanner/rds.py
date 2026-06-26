@@ -40,9 +40,13 @@ def discover(tenant_id: str, account_id: str, region: str, role_arn: str, extern
                     "DBInstanceClass": db['DBInstanceClass'],
                     "Engine": db['Engine'],
                     "DBInstanceStatus": db['DBInstanceStatus'],
-                    "MultiAZ": db['MultiAZ'], # Critical for production anchor detection
+                    "MultiAZ": db['MultiAZ'], 
                     "PubliclyAccessible": db['PubliclyAccessible'],
-                    "VpcSecurityGroups": [sg['VpcSecurityGroupId'] for sg in db.get('VpcSecurityGroups', [])]
+                    "VpcSecurityGroups": [sg['VpcSecurityGroupId'] for sg in db.get('VpcSecurityGroups', [])],
+                    "DBSubnetGroupName":  db.get('DBSubnetGroup', {}).get('DBSubnetGroupName'),
+                    "AvailabilityZone": db.get('AvailabilityZone'),
+                    "AllocatedStorage": db.get('AllocatedStorage'),
+                    "StorageType": db.get('StorageType')
                 }
             )
             

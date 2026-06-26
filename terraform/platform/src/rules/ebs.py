@@ -29,7 +29,7 @@ def evaluate(resource: Dict[str, Any], metrics: Dict[str, Any], pattern: Workloa
             hcl_diff = f"""
             # Architectural Migration: Remove dead attached volume
 # Note: CloudOptix has automatically backed up this volume to the 'CloudOptix-Archive-Vault'.
-- resource "aws_ebs_volume" "<your_resource_name>" {{ ... }}
+- resource "aws_ebs_volume" "{vol_id}" {{ ... }}
             """
             
             return RuleResult(
@@ -53,7 +53,7 @@ def evaluate(resource: Dict[str, Any], metrics: Dict[str, Any], pattern: Workloa
     if vol_type == 'gp2':
         hcl_diff = f"""
 # Architectural Migration: Modernize Legacy Storage
-resource "aws_ebs_volume" "<your_resource_name>" {{
+resource "aws_ebs_volume" "{vol_id}" {{
 -  type = "gp2"
 +  type = "gp3"
 }}
@@ -70,7 +70,7 @@ resource "aws_ebs_volume" "<your_resource_name>" {{
     if vol_type == 'io1':
         hcl_diff = f"""
 # Architectural Migration: Resilience Upgrade
-resource "aws_ebs_volume" "<your_resource_name>" {{
+resource "aws_ebs_volume" "{vol_id}" {{
 -  type = "io1"
 +  type = "io2"
 }}

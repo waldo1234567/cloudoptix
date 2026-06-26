@@ -14,6 +14,10 @@ def evaluate(resource: Dict[str, Any], metrics: Dict[str, Any], pattern: Workloa
     instance_class = meta.get('DBInstanceClass', '')
     engine = meta.get('Engine', 'unknown')
     db_id = resource.get('SK', '').split('RESOURCE#')[-1]
+    subnet_group   = meta.get('DBSubnetGroupName')
+    vpc_sg_ids     = meta.get('VpcSecurityGroups', [])
+    sg_ids_str     = ', '.join(f'"{g}"' for g in vpc_sg_ids)
+    max_capacity = RDS_DOWNSIZE_MAP.get(instance_class, 16)
     
     if status != 'available':
         return RuleResult(Action.IGNORE, Confidence.HIGH, f"Database status is '{status}'.", "SAFE", 0.0)
@@ -70,13 +74,16 @@ def evaluate(resource: Dict[str, Any], metrics: Dict[str, Any], pattern: Workloa
             hcl_diff = f"""
 # Architectural Migration: Provisioned RDS -> Aurora Serverless v2
 resource "aws_rds_cluster" "{db_id}_serverless" {{
-  cluster_identifier = "{db_id}-aurora-cluster"
-  engine             = "{target_engine}"
-  engine_mode        = "provisioned" # Required mode for Serverless v2
+    cluster_identifier = "{db_id}-aurora-cluster"
+    engine             = "{target_engine}"
+    engine_mode        = "provisioned" # Required mode for Serverless v2
+    db_subnet_group_name    = "{subnet_group}"
+    vpc_security_group_ids  = [{sg_ids_str}]
+    manage_master_user_password = true 
   
   serverlessv2_scaling_configuration {{
     min_capacity = 0.5
-    max_capacity = 16.0
+    max_capacity = {max_capacity}
   }}
 }}
 

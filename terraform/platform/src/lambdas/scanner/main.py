@@ -23,8 +23,10 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 dynamodb = boto3.resource('dynamodb')
+sqs = boto3.client('sqs')
 TABLE_NAME = os.environ.get('DYNAMODB_TABLE_NAME', 'cloudoptix-core-table')
 table = dynamodb.Table(TABLE_NAME) # type: ignore
+GRAPH_QUEUE_URL = os.environ.get('GRAPH_QUEUE_URL', '')
 
 SCANNERS = [
     ec2.discover,
@@ -94,7 +96,13 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 })
         
         logger.info(f"Scan complete for {tenant_id}. Inserted {len(all_resources)} resources into DynamoDB.")
-    
+
+        sqs.send_message(
+            QueueUrl=GRAPH_QUEUE_URL,
+            MessageGroupId=tenant_id,
+            MessageBody=json.dumps({"tenant_id": tenant_id})
+        )
+        
     return {
         "statusCode": 200,
         "body": "SQS Batch processed successfully."
