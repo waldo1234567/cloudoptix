@@ -1,6 +1,6 @@
 from typing import Dict, Any
 from .models import Action, Confidence, RuleResult
-from terraform.platform.src.lambdas.metrics.classfier import WorkloadPattern
+from lambdas.metrics.classfier import WorkloadPattern
 
 def evaluate(resource: Dict[str, Any], metrics: Dict[str, Any], pattern: WorkloadPattern) -> RuleResult:
     nat_id = resource.get('SK', '').split('RESOURCE#')[-1]

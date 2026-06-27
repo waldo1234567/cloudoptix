@@ -50,9 +50,10 @@ def classify_resource(resource_data: Dict[str, Any])  -> WorkloadPattern:
     if not metrics:
         return WorkloadPattern.UNKNOWN
     
-    if res_type in ['instance', 'db-instance', 'cluster']:
+    if res_type in ['instance', 'db-instance', 'service']:
         cpu_avg = metrics.get('CPUUtilization', {}).get('Average', 0.0)
         cpu_p99 = metrics.get('CPUUtilization', {}).get('p99', 0.0)
+        network_active = False
         
         if res_type == 'instance' :
             net_in = metrics.get('NetworkIn', {}).get('Average', 0.0)
@@ -61,7 +62,7 @@ def classify_resource(resource_data: Dict[str, Any])  -> WorkloadPattern:
         elif res_type == 'db-instance':
             connections = metrics.get('DatabaseConnections', {}).get('Maximum', 0)
             network_active = connections > 0
-        else :
+        elif res_type == 'service':
             network_active = True
         
         return _classify_compute_pattern(cpu_avg, cpu_p99, is_unsafe, network_active)
@@ -72,15 +73,23 @@ def classify_resource(resource_data: Dict[str, Any])  -> WorkloadPattern:
         if state == 'available':
             return WorkloadPattern.ABANDONED
 
+    if res_type == 'eipalloc':
+        return WorkloadPattern.UNKNOWN
+
+    if res_type == 'bucket':
+        return WorkloadPattern.UNKNOWN
+
+    if not metrics:
+        return WorkloadPattern.UNKNOWN
+    
+    if res_type == 'volume':
         read_ops = metrics.get('VolumeReadOps', {}).get('Maximum', 0)
         write_ops = metrics.get('VolumeWriteOps', {}).get('Maximum', 0)
         idle_time = metrics.get('VolumeIdleTime', {}).get('Average', 0.0)
         
         if read_ops == 0 and write_ops == 0 and idle_time > 99.0:
             return WorkloadPattern.ABANDONED if not is_unsafe else WorkloadPattern.ALWAYS_ON_IDLE
-        
         return WorkloadPattern.ALWAYS_ON_ACTIVE
-
     
     if res_type == 'function':
         invocations = metrics.get('Invocations', {}).get('Sum', 0)
@@ -90,8 +99,7 @@ def classify_resource(resource_data: Dict[str, Any])  -> WorkloadPattern:
             return WorkloadPattern.ABANDONED
         if invocations < 100:
             return WorkloadPattern.ALWAYS_ON_IDLE
-        
-        
+    
         return WorkloadPattern.SPIKY
     
     if res_type == 'loadbalancer':
@@ -136,10 +144,8 @@ def classify_resource(resource_data: Dict[str, Any])  -> WorkloadPattern:
         
         if curr_connections == 0:
             return WorkloadPattern.ABANDONED if not is_unsafe else WorkloadPattern.ALWAYS_ON_IDLE
-
         if cpu_avg < 2.0:
             return WorkloadPattern.ALWAYS_ON_IDLE
-        
         return WorkloadPattern.ALWAYS_ON_ACTIVE
     
     if res_type == 'filesystem':

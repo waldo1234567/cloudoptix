@@ -1,3 +1,4 @@
+import os
 import time
 import json
 import boto3
@@ -56,6 +57,7 @@ class ExecutionEngine:
         action = rule_result.get('action')
         tasks = rule_result.get('system_tasks', [])
         
+        logger.info(f"Probe action execution starting: action={action}, resource_id={resource_id}, resource_type={resource_type}")
         task_state = {}
         if tasks:
             task_state = self._execute_system_tasks(tasks, resource_id)
@@ -125,7 +127,39 @@ class ExecutionEngine:
         return state
     
     def _handle_tier_3_iac(self, resource_id: str, resource_type: str, rule_result: Dict, task_state: Dict) -> Dict:
-        return {"status": "SUCCESS", "message": "IaC generated successfully."}
+        hcl_diff = rule_result.get('terraform_hcl_diff', 'No HCL provided.')
+        reasoning = rule_result.get('reasoning', 'No reasoning provided.')
+        savings = rule_result.get('estimated_monthly_savings', 0.0)
+        
+        logger.info(f"\n=====================================")
+        logger.info(f"GENERATED IAC FOR {resource_id}")
+        logger.info(f"Reason: {reasoning}")
+        logger.info(f"Savings: ${savings}/mo")
+        logger.info(f"{hcl_diff}")
+        logger.info(f"=====================================\n")
+        
+        try:
+            dynamodb = boto3.resource('dynamodb', region_name=self.region)
+            table = dynamodb.Table(os.environ.get('DYNAMODB_TABLE_NAME', 'cloudoptix-core-table')) # type: ignore
+            table.put_item(
+                Item={
+                    'PK': f"TENANT#{self.tenant_id}",
+                    'SK': f"FINDING#{resource_id}",
+                    'Type': 'Recommendation',
+                    'ResourceId': resource_id,
+                    'ResourceType': resource_type,
+                    'Action': 'TIER_3_IAC',
+                    'Reasoning': reasoning,
+                    'EstimatedMonthlySavings': str(savings), 
+                    'TerraformHCL': hcl_diff,
+                    'Status': 'PENDING_APPROVAL',
+                    'Timestamp': datetime.now(timezone.utc).isoformat()
+                }
+            )
+            return {"status": "SUCCESS", "message": "IaC generated and saved to DynamoDB database."}
+        except Exception as e:
+            logger.error(f"Failed to save finding to DynamoDB: {e}")
+            return {"status": "FAILED", "message": f"Failed to save finding: {e}"}
     
     def _handle_tier_1_delete(self, resource_id: str, resource_type: str, rule_result: Dict, task_state: Dict) -> Dict:
         if resource_type == 'volume':
@@ -325,22 +359,38 @@ def _route_tier_1_stop(engine: 'ExecutionEngine', resource_id: str, resource_typ
 
     
 def lambda_handler(event, context):
+    logger.info(f"Probe lambda invoked with event: {event}")
+    records = event.get("Records", [])
+    if not records:
+        raise ValueError("No SQS record found")
+    
+    record = records[0]
+    logger.info(f"Probe received SQS record: {record}")
+    
     try:
+        body = json.loads(record["body"])
+        logger.info(f"Probe parsed message body: {body}")
         engine = ExecutionEngine(
-            tenant_id=event['tenant_id'],
-            tenant_role_arn=event['tenant_role_arn'],
-            region=event['region'],
-            sns_topic_arn=event['sns_topic_arn'],
-            external_id=event.get('external_id', 'cloudoptix-ext-test-001')
+            tenant_id=body['tenant_id'],
+            tenant_role_arn=body['tenant_role_arn'],
+            region=body['region'],
+            sns_topic_arn=body['sns_topic_arn'],
+            external_id=body.get('external_id', 'cloudoptix-ext-test-001')
         )
         
-        resource_id   = event['resource_id']
-        resource_type = event['resource_type']
-        rule_result   = event.get('rule_result', {})
+        resource_id   = body['resource_id']
+        resource_type = body['resource_type']
+        rule_result   = body.get('rule_result', {})
         
+        logger.info(f"Probe executing resource_id={resource_id}, resource_type={resource_type}")
+        logger.info(f"Probe rule_result payload: {rule_result}")
         engine.ACTION_REGISTRY['TIER_1_STOP'] = lambda rid, rtype, rr, ts: _route_tier_1_stop(engine, rid, rtype, rr, ts) # type: ignore
  
-        return engine.execute_rule_result(resource_id, resource_type, rule_result)
+        result = engine.execute_rule_result(resource_id, resource_type, rule_result)
+        logger.info(f"Probe result: {result}")
+        if isinstance(result, dict):
+            result.setdefault("terraform_hcl_diff", rule_result.get("terraform_hcl_diff"))
+        return result
     except Exception as e:
         logger.error(f"Probe Lambda crashed: {e}", exc_info=True)
         return {"status": "ERROR", "message": str(e)}

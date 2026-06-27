@@ -1,6 +1,6 @@
 from typing import Dict, Any
 from .models import Action, Confidence, RuleResult
-from terraform.platform.src.lambdas.metrics.classfier import WorkloadPattern
+from lambdas.metrics.classfier import WorkloadPattern
 
 def evaluate(resource: Dict[str, Any], metrics: Dict[str, Any], pattern: WorkloadPattern) -> RuleResult:
     meta = resource.get('RawMetadata', {})
@@ -16,11 +16,10 @@ def evaluate(resource: Dict[str, Any], metrics: Dict[str, Any], pattern: Workloa
         if billing_mode == 'PROVISIONED':
             hcl_diff = f"""
             # Architectural Migration: Stop hourly bleeding on an abandoned table
-resource "aws_dynamodb_table" "{table_name}" {{
--  billing_mode = "PROVISIONED"
-+  billing_mode = "PAY_PER_REQUEST"
-   # Note: Read/Write capacity blocks must be removed when using PAY_PER_REQUEST
-}}           
+resource "aws_dynamodb_table" "__TF_ALIAS__" {{
+  billing_mode = "PAY_PER_REQUEST"
+  # Note: Read/Write capacity blocks must be removed from the original source.
+}}          
             """
             
             return RuleResult(

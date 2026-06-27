@@ -13,14 +13,19 @@ resource "aws_sqs_queue" "action_queue" {
 }
 
 resource "aws_sqs_queue" "graph_queue" {
-  name                        = "CloudOptix-Graph-Queue.fifo"
-  fifo_queue                  = true
-  visibility_timeout_seconds  = 300
+  name                       = "CloudOptix-Graph-Queue.fifo"
+  fifo_queue                 = true
+  visibility_timeout_seconds = 300
 }
 
 resource "aws_sqs_queue" "metrics_queue" {
-  name                        = "CloudOptix-Metrics-Queue.fifo"
-  fifo_queue                  = true
-  visibility_timeout_seconds  = 300
+  name                       = "CloudOptix-Metrics-Queue.fifo"
+  fifo_queue                 = true
+  visibility_timeout_seconds = 300
 }
 
+resource "aws_sqs_queue" "rules_queue" {
+  name                       = "CloudOptix-Rules-Queue.fifo"
+  fifo_queue                 = true
+  visibility_timeout_seconds = 300
+}

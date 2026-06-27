@@ -1,7 +1,7 @@
 import logging
 from typing import Dict, Any
 from .models import RuleResult, Action, Confidence
-from src.lambdas.metrics.classfier import WorkloadPattern
+from lambdas.metrics.classfier import WorkloadPattern
 
 logger = logging.getLogger(__name__)
 

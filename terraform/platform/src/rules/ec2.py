@@ -1,6 +1,7 @@
+import json
 from typing import Dict, Any
 from .models import Action, Confidence, RuleResult
-from src.lambdas.metrics.classfier import WorkloadPattern
+from lambdas.metrics.classfier import WorkloadPattern
 
 DOWNSIZE_MAP = {
     't3.medium': 't3.small', 't3.large': 't3.medium', 't3.xlarge': 't3.large',
@@ -18,33 +19,13 @@ EC2_MONTHLY_PRICING = {
 
 def evaluate(resource: Dict[str, Any], metrics: Dict[str, Any],pattern: WorkloadPattern) -> RuleResult:
     meta = resource.get('RawMetadata', {})
-    state = meta.get('State', 'unknown')
-    instance_type = meta.get('InstanceType', '')
     res_id = resource.get('SK', '').split('RESOURCE#')[-1]
+    instance_type = meta.get('InstanceType')
+    current_cost = EC2_MONTHLY_PRICING.get(instance_type)
     
-    if state != 'running':
-        return RuleResult(Action.IGNORE, Confidence.HIGH, f"Instance state is '{state}'.", "SAFE", 0.0)
-    
-    
-    status_failed = metrics.get('StatusCheckFailed', {}).get('Maximum', 1.0)
-    
-    if status_failed > 0:
-        return RuleResult(
-            Action.IGNORE, Confidence.HIGH, 
-            "Instance reported failed status checks in the last 14 days.", 
-            "HIGH - Host is unhealthy or AWS is performing maintenance.", 0.0
-        )
-        
-    if instance_type.startswith('t'):
-        credit_balance = metrics.get('CPUCreditBalance', {}).get('Average', 100)
-        if credit_balance < 50:
-            return RuleResult(
-                Action.IGNORE, Confidence.HIGH, 
-                f"Burstable instance is CPU-throttled (Avg Credit Balance: {credit_balance:.1f}).", 
-                "HIGH - Modification will cause performance outage.", 0.0
-            )
-    
-    current_cost = EC2_MONTHLY_PRICING.get(instance_type, 0.0)
+    ami_id = meta.get('ImageId', 'ami-REQUIRED')
+    subnet_id = meta.get('SubnetId', 'subnet-REQUIRED')
+    sg_ids = json.dumps([sg.get('GroupId') for sg in meta.get('SecurityGroups', [])])
     
     if pattern == WorkloadPattern.ABANDONED:
         return RuleResult(
@@ -52,31 +33,33 @@ def evaluate(resource: Dict[str, Any], metrics: Dict[str, Any],pattern: Workload
             confidence=Confidence.HIGH,
             reasoning="Instance is mathematically abandoned. Executor will Stop the instance and monitor for health check failures.",
             blast_radius_assessment="LOW - Resource is isolated and inactive. Rollback probe attached.",
-            estimated_monthly_savings=current_cost
+            estimated_monthly_savings=current_cost # type: ignore
         )
     
     if pattern == WorkloadPattern.SPIKY:
         hcl_diff = f"""
 # Architectural Migration: Static Instance -> Target-Tracked ASG
-resource "aws_launch_template" "{res_id}_template" {{
-  name_prefix   = "{res_id}-"
-  instance_type = "{instance_type}"
-  # AMI and Security Groups must be mapped from the original instance state
+resource "aws_launch_template" "__TF_ALIAS___tmpl" {{
+  name_prefix   = "spiky-tmpl-"
+  image_id      = "{ami_id}"
+  instance_type = "{instance_type if instance_type else 't3.micro'}"
+  vpc_security_group_ids = {sg_ids}
 }}
 
-resource "aws_autoscaling_group" "{res_id}_asg" {{
+resource "aws_autoscaling_group" "__TF_ALIAS___asg" {{
+  vpc_zone_identifier = ["{subnet_id}"]
   desired_capacity    = 1
   max_size           = 3
   min_size           = 1
   launch_template {{
-    id      = aws_launch_template.{res_id}_template.id
+    id      = aws_launch_template.__TF_ALIAS___tmpl.id
     version = "$Latest"
   }}
 }}
 
-resource "aws_autoscaling_policy" "{res_id}_tracking" {{
-  name                   = "{res_id}-cpu-tracking"
-  autoscaling_group_name = aws_autoscaling_group.{res_id}_asg.name
+resource "aws_autoscaling_policy" "__TF_ALIAS___cpu_policy" {{
+  name                   = "cpu-target-tracking"
+  autoscaling_group_name = aws_autoscaling_group.__TF_ALIAS___asg.name
   policy_type            = "TargetTrackingScaling"
   target_tracking_configuration {{
     predefined_metric_specification {{
@@ -92,13 +75,13 @@ resource "aws_autoscaling_policy" "{res_id}_tracking" {{
             confidence=Confidence.MEDIUM,
             reasoning="Workload exhibits extreme variance. Migrating to an ASG absorbs spikes while saving money during baseline.",
             blast_radius_assessment="MEDIUM - Requires architectural refactor and AMI creation.",
-            estimated_monthly_savings=current_cost * 0.40,
+            estimated_monthly_savings=0.0,
             terraform_hcl_diff=hcl_diff.strip()
         )
     
     if pattern == WorkloadPattern.SCHEDULED:
-        ami_id          = meta.get('ImageId', '<ami-id-from: terraform state list | grep ' + res_id + '>')
-        subnet_id       = meta.get('SubnetId', '')
+        ami_id          = meta.get('ImageId', 'ami-REQUIRED')
+        subnet_id       = meta.get('SubnetId', 'subnet-REQUIRED')
         security_groups = meta.get('SecurityGroups', [])
         sg_ids          = [sg['GroupId'] for sg in security_groups]
         sg_ids_str      = ', '.join(f'"{g}"' for g in sg_ids) if sg_ids else '# No security groups found in scanner'
@@ -106,45 +89,40 @@ resource "aws_autoscaling_policy" "{res_id}_tracking" {{
         
         hcl_diff = f"""
 # Architectural Migration: Native AWS ASG Scheduling
-resource "aws_ami_from_instance" "{res_id}_backup" {{
-  name               = "{res_id}-scheduled-baseline"
-  source_instance_id = "{res_id}"
-}}
-
-resource "aws_launch_template" "{res_id}_template" {{
-    name_prefix   = "{res_id}-"
+resource "aws_launch_template" "__TF_ALIAS___tmpl" {{
+    name_prefix   = "scheduled-tmpl-"
     image_id      = "{ami_id}"
-    instance_type = "{instance_type}"
-    vpc_security_group_ids = [{sg_ids_str}]
+    instance_type = "{instance_type if instance_type else 't3.micro'}"
+    vpc_security_group_ids = {sg_ids}
 }}
 
-resource "aws_autoscaling_group" "{res_id}_asg" {{
+resource "aws_autoscaling_group" "__TF_ALIAS___asg" {{
   vpc_zone_identifier = ["{subnet_id}"]
   desired_capacity    = 1
   max_size            = 1
   min_size            = 0
   
   launch_template {{
-    id      = aws_launch_template.{res_id}_template.id
+    id      = aws_launch_template.__TF_ALIAS___tmpl.id
     version = "$Latest"
   }}
 }}
-resource "aws_autoscaling_schedule" "{res_id}_scale_down" {{
+resource "aws_autoscaling_schedule" "__TF_ALIAS___scale_down" {{
   scheduled_action_name  = "scale-down-evening"
   min_size               = 0
   max_size               = 0
   desired_capacity       = 0
-  recurrence             = "0 19 * * *"
-  autoscaling_group_name = aws_autoscaling_group.{res_id}_asg.name
+  recurrence             = "0 19 * * MON-FRI" 
+  autoscaling_group_name = aws_autoscaling_group.__TF_ALIAS___asg.name
 }}
 
-resource "aws_autoscaling_schedule" "{res_id}_scale_up" {{
+resource "aws_autoscaling_schedule" "__TF_ALIAS___scale_up" {{
   scheduled_action_name  = "scale-up-morning"
   min_size               = 1
   max_size               = 1
   desired_capacity       = 1
-  recurrence             = "0 8 * * *"
-  autoscaling_group_name = aws_autoscaling_group.{res_id}_asg.name
+  recurrence             = "0 8 * * MON-FRI"
+  autoscaling_group_name = aws_autoscaling_group.__TF_ALIAS___asg.name
 }}
         """
         return RuleResult(
@@ -152,7 +130,7 @@ resource "aws_autoscaling_schedule" "{res_id}_scale_up" {{
             confidence=Confidence.HIGH,
             reasoning="Workload maps perfectly to business hours. Wrapping in an ASG with cron-based scaling automates shutdowns safely.",
             blast_radius_assessment="LOW - Wrapping a single instance in an ASG requires minimal configuration.",
-            estimated_monthly_savings=current_cost * 0.65, # Saving ~65% by turning off nights and weekends
+            estimated_monthly_savings=40.0, # Saving ~65% by turning off nights and weekends
             terraform_hcl_diff=hcl_diff.strip(),
             system_tasks=[]
         )
@@ -173,9 +151,8 @@ resource "aws_autoscaling_schedule" "{res_id}_scale_up" {{
         
         hcl_diff = f"""
         # Architectural Migration: Static Downsize
-resource "aws_instance" "{res_id}" {{
--  instance_type = "{instance_type}"
-+  instance_type = "{target_type}"
+resource "aws_instance" "__TF_ALIAS__" {{
+  instance_type = "{target_type}"
 }}
         """
         return RuleResult(

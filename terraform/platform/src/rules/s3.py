@@ -50,4 +50,4 @@ resource "aws_s3_bucket_lifecycle_configuration" "{bucket_name}_tiering" {{
             terraform_hcl_diff=hcl.strip()
         )
 
-    return RuleResult(action=Action.NONE, confidence=Confidence.HIGH, reasoning="Optimized", blast_radius_assessment="N/A", estimated_monthly_savings=0.0)
+    return RuleResult(action=Action.IGNORE, confidence=Confidence.HIGH, reasoning="Optimized", blast_radius_assessment="N/A", estimated_monthly_savings=0.0)

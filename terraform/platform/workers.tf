@@ -62,7 +62,7 @@ resource "aws_lambda_function" "scanner" {
   environment {
     variables = {
       DYNAMODB_TABLE_NAME = aws_dynamodb_table.cloudoptix_table.name
-      GRAPH_QUEUE_URL = aws_sqs_queue.graph_queue.url
+      GRAPH_QUEUE_URL     = aws_sqs_queue.graph_queue.url
     }
   }
 }
@@ -79,7 +79,7 @@ resource "aws_lambda_function" "graph_builder" {
   environment {
     variables = {
       DYNAMODB_TABLE_NAME = aws_dynamodb_table.cloudoptix_table.name
-      METRICS_QUEUE_URL = aws_sqs_queue.metrics_queue.url
+      METRICS_QUEUE_URL   = aws_sqs_queue.metrics_queue.url
     }
   }
 }
@@ -95,9 +95,28 @@ resource "aws_lambda_function" "metrics_collector" {
   environment {
     variables = {
       DYNAMODB_TABLE_NAME = aws_dynamodb_table.cloudoptix_table.name
-      ACTION_QUEUE_URL = aws_sqs_queue.action_queue.url
+      RULES_QUEUE_URL     = aws_sqs_queue.rules_queue.url
     }
   }
+}
+
+
+resource "aws_lambda_function" "rules_engine" {
+  filename         = data.archive_file.backend_zip.output_path
+  source_code_hash = data.archive_file.backend_zip.output_base64sha256
+  function_name    = "CloudOptix-Rules-Engine"
+  role             = aws_iam_role.worker_lambda_role.arn
+  handler          = "rules.engine.lambda_handler"
+  runtime          = "python3.11"
+  timeout          = 300
+
+  environment {
+    variables = {
+      DYNAMODB_TABLE_NAME = aws_dynamodb_table.cloudoptix_table.name
+      ACTION_QUEUE_URL    = aws_sqs_queue.action_queue.url
+    }
+  }
+
 }
 
 resource "aws_lambda_function" "probe_executor" {
@@ -153,7 +172,11 @@ resource "aws_lambda_event_source_mapping" "metrics_trigger" {
   batch_size       = 1
 }
 
-
+resource "aws_lambda_event_source_mapping" "rules_trigger" {
+  event_source_arn = aws_sqs_queue.rules_queue.arn
+  function_name    = aws_lambda_function.rules_engine.arn 
+  batch_size       = 1
+}
 
 resource "aws_iam_role_policy_attachment" "action_sqs_trigger" {
   role       = aws_iam_role.worker_lambda_role.name

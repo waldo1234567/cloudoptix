@@ -12,6 +12,7 @@ logger.setLevel(logging.INFO)
 
 dynamodb = boto3.resource('dynamodb')
 TABLE_NAME = os.environ.get('RECOMMENDATIONS_TABLE', 'cloudoptix-recommendations-prod')
+CORE_TABLE_NAME = os.environ.get('DYNAMODB_TABLE_NAME', 'cloudoptix-core-table')
 
 def fetch_approved_rules_in_batches(tenant_id: str, rule_ids: List[str]) -> List[Dict[str,Any]]:
     fetched_items = []
@@ -46,82 +47,60 @@ def fetch_approved_rules_in_batches(tenant_id: str, rule_ids: List[str]) -> List
                     time.sleep((2 ** retries) * 0.1)
                     
                 else:
-                    request_items = None
+                    break
                     
             except ClientError as e:
                 logger.error(f"DynamoDB BatchGetItem failed: {e}")
                 raise Exception("Failed to retrieve recommendations from database.")
             
-        if request_items:
-            logger.error("Max retries exceeded for DynamoDB BatchGetItem.")
-            raise Exception("Database timeout. Some configurations could not be loaded.")
-        
     return fetched_items
 
-def compile_terraform(tenant_id: str, items: List[Dict[str, Any]]) -> str:
-    timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-    
-    compiled_hcl = f"""
-# ==============================================================================
-# CloudOptix Autonomous Architecture Plan
-# Generated: {timestamp} UTC
-# Tenant Context: {tenant_id}
-# ==============================================================================
-# INSTRUCTIONS:
-# 1. Place this file in your target environment's Terraform directory.
-# 2. Replace placeholder IDs (e.g., <your_resource_name>) with your actual 
-#    Terraform resource addresses from your existing state.
-# 3. Run `terraform plan` to review the architectural delta.
-# ==============================================================================
-"""
-    grouped_changes = {
-        "Compute (EC2 & ASG)": [],
-        "Database (RDS & DynamoDB)": [],
-        "Storage (EBS & EFS)": [],
-        "Networking (NAT, ALB, EIP)": [],
-        "Serverless & IAM": []
-    }    
-    
-    for item in items:
-        if item.get('Action') != 'TIER_3_IAC':
-            continue
-        
-        res_type = item.get('ResourceType', 'unknown').lower()
-        hcl_snippet = item.get('TerraformHclDiff', '').strip()
-        reasoning = item.get('Reasoning', 'Architectural optimization.')
-        res_id = item.get('ResourceId', 'Unknown')
-        
-        if not hcl_snippet:
-            continue
-        
-        block = f"""
-# ---------------------------------------------------------
-# Target: {res_id}
-# Strategy: {reasoning}
-# ---------------------------------------------------------
-{hcl_snippet}
-"""
-        if res_type in ['instance', 'autoscalinggroup']: 
-            grouped_changes["Compute (EC2 & ASG)"].append(block)
-        elif res_type in ['db-instance', 'table']: 
-            grouped_changes["Database (RDS & DynamoDB)"].append(block)
-        elif res_type in ['volume', 'filesystem']: 
-            grouped_changes["Storage (EBS & EFS)"].append(block)
-        elif res_type in ['natgateway', 'loadbalancer', 'eip']: 
-            grouped_changes["Networking (NAT, ALB, EIP)"].append(block)
-        elif res_type in ['function', 'role']: 
-            grouped_changes["Serverless & IAM"].append(block)
-        else: 
-            grouped_changes["Compute (EC2 & ASG)"].append(block)
+def compile_terraform(tenant_id: str, raw_items: List[Dict[str, Any]]) -> str:
+    resource_ids = [item.get('ResourceId') for item in raw_items if item.get('ResourceId')]
+    state_map = {}
+    if resource_ids:
+        chunks = [resource_ids[i:i + 100] for i in range(0, len(resource_ids), 100)]
+        for chunk in chunks:
+            keys_to_get = [{'PK': f"TENANT#{tenant_id}", 'SK': f"STATEADDR#{res_id}"} for res_id in chunk]
+            request_items = { CORE_TABLE_NAME: {'Keys': keys_to_get, 'ConsistentRead': False} }
             
+            try:
+                response = dynamodb.meta.client.batch_get_item(RequestItems=request_items) # type: ignore
+                for item in response.get('Responses', {}).get(CORE_TABLE_NAME, []):
+                    res_id = item['SK'].split('STATEADDR#')[-1]
+                    state_map[res_id] = item.get('TerraformAddress')
+            except ClientError as e:
+                logger.error(f"Failed to fetch State Addresses: {e}")
     
-    for category, blocks in grouped_changes.items():
-        if blocks:
-            compiled_hcl += f"\n# {'='*70}\n# {category}\n# {'='*70}\n"
-            compiled_hcl += "\n".join(blocks)
-    
-    return compiled_hcl
+    assembled_hcl = []
 
+    for item in raw_items:
+        res_id = item.get('ResourceId', 'unknown')
+        res_type = item.get('ResourceType', 'resource')
+        raw_hcl = item.get('TerraformHCL', '')
+        
+        tf_address = state_map.get(res_id)
+        
+        if tf_address:
+            final_block = raw_hcl.replace('__TF_ALIAS__', tf_address)
+            assembled_hcl.append(final_block)
+        else:
+            safe_alias = f"aws_{res_type.replace('-', '_')}.cloudoptix_imported"
+            fallback_msg = f"""
+# ==============================================================================
+# CLOUDOPTIX FALLBACK: UNMANAGED RESOURCE
+# Resource: {res_id}
+# Warning: This resource is missing from your terraform.tfstate. 
+# It was likely created via the AWS Console manually.
+# To safely apply this architectural migration, run this command first:
+# 
+# terraform import {tf_address or safe_alias} {res_id}
+# ==============================================================================
+"""
+            final_block = fallback_msg + raw_hcl.replace('__TF_ALIAS__', safe_alias)
+            assembled_hcl.append(final_block)
+            
+    return "\n\n".join(assembled_hcl)
 
 def lambda_handler(event, context):
     
@@ -144,7 +123,7 @@ def lambda_handler(event, context):
 
     try:
         body = json.loads(event.get('body', '{}'))
-        rule_ids = body.get('approved_rule_ids', [])
+        rule_ids = body.get('rule_ids', [])
         
         if not isinstance(rule_ids, list) or len(rule_ids) == 0:
             return _build_response(400, {"error": "Malformed request. 'approved_rule_ids' must be a non-empty array."})

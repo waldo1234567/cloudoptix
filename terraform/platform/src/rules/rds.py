@@ -1,6 +1,6 @@
 from typing import Dict, Any
 from .models import Action, Confidence, RuleResult
-from terraform.platform.src.lambdas.metrics.classfier import WorkloadPattern
+from lambdas.metrics.classfier import WorkloadPattern
 
 RDS_DOWNSIZE_MAP = {
     'db.m5.large': 'db.m5.medium', 'db.m5.xlarge': 'db.m5.large',

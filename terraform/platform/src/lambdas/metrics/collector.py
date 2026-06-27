@@ -14,7 +14,7 @@ logger.setLevel(logging.INFO)
 dynamodb = boto3.resource('dynamodb')
 sqs = boto3.client('sqs')
 TABLE_NAME = os.environ.get('DYNAMODB_TABLE_NAME', 'cloudoptix-core-table')
-ACTION_QUEUE_URL = os.environ.get('ACTION_QUEUE_URL', '')
+RULES_QUEUE_URL = os.environ.get('RULES_QUEUE_URL', '')
 table = dynamodb.Table(TABLE_NAME)
 
 # Finalized Metric Registry for Deterministic Rule Evaluation
@@ -227,7 +227,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 collected_count += 1
     
     sqs.send_message(
-        QueueUrl=ACTION_QUEUE_URL,
+        QueueUrl=RULES_QUEUE_URL,
         MessageGroupId=tenant_id,
         MessageBody=json.dumps({"tenant_id": tenant_id})
     )
