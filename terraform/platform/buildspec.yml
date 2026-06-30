@@ -15,7 +15,9 @@ phases:
     commands:
       - echo "Initializing Autonomous Deployment for Tenant ${TENANT_ID}"
 
-      - aws s3 cp s3://${CONFIG_BUCKET}/${CONFIG_KEY} ./main.tf
+      # Sync the full tenant workspace (main.tf, providers.tf, variables.tf, uploaded .tf, etc.)
+      - aws s3 sync s3://${CONFIG_BUCKET}/${TENANT_ID}/ ./ --exclude "*" --include "*.tf"
+      - echo "Workspace files:" && ls -1 *.tf
 
       - echo "Assuming Tenant Execution Role..."
       - CREDS=$(aws sts assume-role --role-arn ${TENANT_ROLE_ARN} --role-session-name CloudOptixIaC-${ACTION_ID} --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text)
@@ -24,12 +26,14 @@ phases:
       - export AWS_SECRET_ACCESS_KEY=$(echo $CREDS | awk '{print $2}')
       - export AWS_SESSION_TOKEN=$(echo $CREDS | awk '{print $3}')
 
+      # CloudOptix owns the backend: regenerate it (overwriting any synced backend.tf)
+      # so the whole tenant workspace shares a single state file.
       - |
         cat <<EOF > backend.tf
         terraform {
           backend "s3" {
             bucket = "${STATE_BUCKET}"
-            key    = "${TENANT_ID}/${RESOURCE_ID}/terraform.tfstate"
+            key    = "${TENANT_ID}/terraform.tfstate"
             region = "${AWS_REGION}"
           }
         }
