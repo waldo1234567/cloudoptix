@@ -94,9 +94,12 @@ resource "aws_iam_role_policy" "api_lambda_permissions" {
         Resource = aws_codebuild_project.terraform_runner.arn
       },
       {
-        Action   = ["s3:PutObject", "s3:GetObject"]
-        Effect   = "Allow"
-        Resource = "${aws_s3_bucket.tenant_configs.arn}/*"
+        Action = ["s3:PutObject", "s3:GetObject"]
+        Effect = "Allow"
+        Resource = [
+          "${aws_s3_bucket.tenant_configs.arn}/*",
+          "${aws_s3_bucket.tenant_tfstate.arn}/*"
+        ]
       },
       {
         Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
@@ -158,6 +161,26 @@ resource "aws_lambda_function" "tenant_mgmt" {
   function_name = "CloudOptix-Tenant-Mgmt"
   role          = aws_iam_role.api_lambda_role.arn
   handler       = "lambdas.tenant_mgmt.handler.lambda_handler"
+  runtime       = "python3.11"
+  timeout       = 30
+
+  environment {
+    variables = {
+      DYNAMODB_TABLE_NAME = aws_dynamodb_table.cloudoptix_table.name
+      CONFIG_BUCKET       = aws_s3_bucket.tenant_configs.bucket
+      STATE_BUCKET        = aws_s3_bucket.tenant_tfstate.bucket
+      PLATFORM_ACCOUNT_ID = data.aws_caller_identity.current.account_id
+    }
+  }
+}
+
+resource "aws_lambda_function" "tf_upload" {
+  filename         = data.archive_file.backend_zip.output_path
+  source_code_hash = data.archive_file.backend_zip.output_base64sha256
+
+  function_name = "CloudOptix-TF-Upload"
+  role          = aws_iam_role.api_lambda_role.arn
+  handler       = "lambdas.tf_upload.handler.lambda_handler"
   runtime       = "python3.11"
   timeout       = 30
 

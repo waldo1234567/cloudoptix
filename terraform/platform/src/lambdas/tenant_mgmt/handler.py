@@ -47,12 +47,12 @@ table = dynamodb.Table(TABLE_NAME)
 
 
 def lambda_handler(event, context):
+    # tenant_mgmt now handles registration only; Path B file upload lives in the
+    # dedicated tf_upload lambda (POST /tenants/{id}/tf/upload).
     route_key = event.get('routeKey', '')
     method = event.get('requestContext', {}).get('http', {}).get('method') or _method_from_route(route_key)
 
     try:
-        if 'tf/upload' in route_key or (event.get('rawPath', '').endswith('/tf/upload')):
-            return _upload_terraform(event)
         if method == 'POST':
             return _register_tenant(event)
         return _response(404, {"error": f"Unsupported route: {route_key}"})
@@ -133,55 +133,6 @@ def _register_tenant(event):
     })
 
 
-def _upload_terraform(event):
-    path_params = event.get('pathParameters') or {}
-    tenant_id = path_params.get('id')
-    if not tenant_id:
-        return _response(400, {"error": "Missing tenant id in path."})
-
-    profile = table.get_item(Key={'PK': f"TENANT#{tenant_id}", 'SK': 'PROFILE'}).get('Item')
-    if not profile:
-        return _response(404, {"error": "Tenant not found. Register before uploading Terraform."})
-
-    body = _parse_body(event)
-    files = body.get('files')
-    if not isinstance(files, list) or not files:
-        return _response(400, {"error": "Body must contain a non-empty 'files' array of {path, content}."})
-
-    uploaded = []
-    for f in files:
-        path = (f or {}).get('path')
-        content = (f or {}).get('content')
-        if not path or content is None:
-            return _response(400, {"error": "Each file requires 'path' and 'content'."})
-        # Guard against path traversal escaping the tenant prefix.
-        safe_path = path.lstrip('/').replace('..', '')
-        s3.put_object(
-            Bucket=CONFIG_BUCKET,
-            Key=f"{tenant_id}/{safe_path}",
-            Body=str(content).encode('utf-8'),
-            ContentType='text/plain',
-        )
-        uploaded.append(safe_path)
-
-    table.update_item(
-        Key={'PK': f"TENANT#{tenant_id}", 'SK': 'PROFILE'},
-        UpdateExpression="SET #status = :status, TerraformUploadedAt = :ts",
-        ExpressionAttributeNames={'#status': 'Status'},
-        ExpressionAttributeValues={
-            ':status': 'TF_UPLOADED',
-            ':ts': datetime.now(timezone.utc).isoformat(),
-        },
-    )
-
-    return _response(200, {
-        "tenant_id": tenant_id,
-        "uploaded_files": uploaded,
-        "count": len(uploaded),
-        "next_step": "CloudOptix will run terraform init + plan to validate your configuration.",
-    })
-
-
 def _scaffold_workspace(tenant_id, account_id, region, tenant_role_arn, external_id, onboarding_path):
     # The CloudOptix CodeBuild runner assumes the tenant role and injects
     # temporary credentials into the environment, so the provider uses those
@@ -218,15 +169,17 @@ variable "account_id" {{
 '''
 
     files = {
-        "providers.tf": providers_tf,
         "variables.tf": variables_tf,
         "backend.tf": backend_tf,
         "cloudoptix_managed.tf": marker_tf,
     }
 
-    # Path A: seed an empty main.tf the first scan will fill with imports + resources.
     if onboarding_path == "A":
+        # Greenfield: own the provider and seed an empty main.tf the first scan fills.
+        files["providers.tf"] = providers_tf
         files["main.tf"] = "# CloudOptix-managed resources will be generated here on first scan.\n"
+    # Path B: provider + main.tf come from the tenant via tf_upload, so we do not
+    # scaffold providers.tf here (it would collide with their provider block).
 
     return files
 
