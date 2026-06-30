@@ -1,3 +1,5 @@
+from dataclasses import asdict
+from datetime import datetime, timezone
 import json
 import os
 import uuid
@@ -5,6 +7,7 @@ import logging
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Dict, Any, List
+import uuid
 from .models import Action, Confidence, RuleResult
 from boto3.dynamodb.conditions import Key
 from lambdas.metrics.classfier import classify_resource, WorkloadPattern

@@ -73,7 +73,7 @@ def classify_resource(resource_data: Dict[str, Any])  -> WorkloadPattern:
         if state == 'available':
             return WorkloadPattern.ABANDONED
 
-    if res_type == 'eipalloc':
+    if res_type == 'eip':
         return WorkloadPattern.UNKNOWN
 
     if res_type == 'bucket':
