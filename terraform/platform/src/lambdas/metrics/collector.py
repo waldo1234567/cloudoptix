@@ -110,7 +110,7 @@ def build_metric_queries(resource_id: str, resource_type: str) -> List[Dict[str,
             'Id' : f"m_{query_idx}_p99",
             'MetricStat' : {
                 'Metric' : {
-                    'NameSpace' : metric['Namespace'],
+                    'Namespace' : metric['Namespace'],
                     'MetricName' : metric['MetricName'],
                     'Dimensions' : [{'Name': dim_key, 'Value' : resource_id}]
                 },
@@ -119,23 +119,23 @@ def build_metric_queries(resource_id: str, resource_type: str) -> List[Dict[str,
             },
             'ReturnData': True
         })
-        
+
         queries.append({
-            'Id' : f"m_{query_idx}_avg",
+            'Id' : f"m_{query_idx}_Average",
             'MetricStat': {
                 'Metric' : {
-                    'NameSpace' : metric['Namespace'],
+                    'Namespace' : metric['Namespace'],
                     'MetricName': metric['MetricName'],
-                    'Dimension': [{'Name': dim_key, 'Value': resource_id}]
+                    'Dimensions': [{'Name': dim_key, 'Value': resource_id}]
                 },
                 'Period': 86400,
                 'Stat': 'Average'
             },
             'ReturnData': True
         })
-        
+
         queries.append({
-            'Id' : f"m_{query_idx}_max",
+            'Id' : f"m_{query_idx}_Maximum",
             'MetricStat': {
                 'Metric' : {
                     'Namespace': metric['Namespace'],
@@ -171,7 +171,7 @@ def process_metrics(cw_client, resource: Dict[str, Any], start_time : datetime, 
         results = {}
         for metric_data in response.get('MetricDataResults', []):
             query_id = metric_data['Id']
-            values = metric_data.get('Value', [])
+            values = metric_data.get('Values', [])
             
             idx = int(query_id.split('_')[1])
             stat = query_id.split('_')[2]
@@ -192,14 +192,25 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
     Triggered after Graph Construction.
     """
-    tenant_id = event['tenant_id']
-    region = event['region']
-    role_arn = event['role_arn']
-    external_id = event['external_id']
-    
+    records = event.get('Records', [])
+    if not records:
+        logger.error("No SQS records found in event.")
+        return {"statusCode": 400, "status": "NO_RECORDS"}
+
+    body = json.loads(records[0]['body'])
+    tenant_id = body.get('tenant_id')
+    if not tenant_id:
+        logger.error("No tenant_id found in SQS message body.")
+        return {"statusCode": 400, "status": "NO_TENANT"}
+
+    profile = table.get_item(Key={'PK': f"TENANT#{tenant_id}", 'SK': 'PROFILE'}).get('Item', {})
+    region = profile.get('TargetRegion', 'ap-northeast-1')
+    role_arn = profile.get('TenantRoleArn', 'arn:aws:iam::123456789012:role/CloudOptix-Tenant-Deployment-Role')
+    external_id = profile.get('ExternalId', 'ext-uuid')
+
     logger.info(f"Starting Metric Collection for Tenant: {tenant_id}")
-    
-    
+
+
     safe_resources = get_safe_resources(tenant_id)
     if not safe_resources:
         return {"status" :"NO_SAFE_RESOURCES", "collected_count": 0}
