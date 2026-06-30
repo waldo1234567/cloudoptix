@@ -1,6 +1,6 @@
 import json
 from typing import Dict, Any
-from .models import Action, Confidence, RuleResult
+from .models import Action, Confidence, RuleResult, HCLEdit
 from lambdas.metrics.classfier import WorkloadPattern
 
 DOWNSIZE_MAP = {
@@ -17,25 +17,32 @@ EC2_MONTHLY_PRICING = {
     'r5.large': 91.98, 'r5.medium': 45.99
 }
 
-def evaluate(resource: Dict[str, Any], metrics: Dict[str, Any],pattern: WorkloadPattern) -> RuleResult:
+def evaluate(resource: Dict[str, Any], metrics: Dict[str, Any], pattern: WorkloadPattern) -> RuleResult:
     meta = resource.get('RawMetadata', {})
     res_id = resource.get('SK', '').split('RESOURCE#')[-1]
     instance_type = meta.get('InstanceType')
-    current_cost = EC2_MONTHLY_PRICING.get(instance_type)
-    
+    current_cost = EC2_MONTHLY_PRICING.get(instance_type, 0.0)
+
     ami_id = meta.get('ImageId', 'ami-REQUIRED')
     subnet_id = meta.get('SubnetId', 'subnet-REQUIRED')
     sg_ids = json.dumps([sg.get('GroupId') for sg in meta.get('SecurityGroups', [])])
-    
+
     if pattern == WorkloadPattern.ABANDONED:
         return RuleResult(
             action=Action.TIER_1_STOP,
             confidence=Confidence.HIGH,
-            reasoning="Instance is mathematically abandoned. Executor will Stop the instance and monitor for health check failures.",
+            reasoning="Instance is mathematically abandoned. Stop the instance and monitor for health check failures.",
             blast_radius_assessment="LOW - Resource is isolated and inactive. Rollback probe attached.",
-            estimated_monthly_savings=current_cost # type: ignore
+            estimated_monthly_savings=current_cost,
+            hcl_edits=[HCLEdit(
+                edit_type="update_attribute",
+                resource_address="__TF_ADDRESS__",
+                attribute_path="instance_state",
+                old_value="running",
+                new_value="stopped",
+            )],
         )
-    
+
     if pattern == WorkloadPattern.SPIKY:
         hcl_diff = f"""
 # Architectural Migration: Static Instance -> Target-Tracked ASG
@@ -69,24 +76,27 @@ resource "aws_autoscaling_policy" "__TF_ALIAS___cpu_policy" {{
   }}
 }}
         """
-        
+
         return RuleResult(
             action=Action.TIER_3_IAC,
             confidence=Confidence.MEDIUM,
             reasoning="Workload exhibits extreme variance. Migrating to an ASG absorbs spikes while saving money during baseline.",
             blast_radius_assessment="MEDIUM - Requires architectural refactor and AMI creation.",
             estimated_monthly_savings=0.0,
-            terraform_hcl_diff=hcl_diff.strip()
+            hcl_edits=[HCLEdit(
+                edit_type="replace_resource",
+                resource_address="__TF_ADDRESS__",
+                full_resource_hcl=hcl_diff.strip(),
+            )],
         )
-    
+
     if pattern == WorkloadPattern.SCHEDULED:
         ami_id          = meta.get('ImageId', 'ami-REQUIRED')
         subnet_id       = meta.get('SubnetId', 'subnet-REQUIRED')
         security_groups = meta.get('SecurityGroups', [])
         sg_ids          = [sg['GroupId'] for sg in security_groups]
         sg_ids_str      = ', '.join(f'"{g}"' for g in sg_ids) if sg_ids else '# No security groups found in scanner'
-        
-        
+
         hcl_diff = f"""
 # Architectural Migration: Native AWS ASG Scheduling
 resource "aws_launch_template" "__TF_ALIAS___tmpl" {{
@@ -101,7 +111,7 @@ resource "aws_autoscaling_group" "__TF_ALIAS___asg" {{
   desired_capacity    = 1
   max_size            = 1
   min_size            = 0
-  
+
   launch_template {{
     id      = aws_launch_template.__TF_ALIAS___tmpl.id
     version = "$Latest"
@@ -112,7 +122,7 @@ resource "aws_autoscaling_schedule" "__TF_ALIAS___scale_down" {{
   min_size               = 0
   max_size               = 0
   desired_capacity       = 0
-  recurrence             = "0 19 * * MON-FRI" 
+  recurrence             = "0 19 * * MON-FRI"
   autoscaling_group_name = aws_autoscaling_group.__TF_ALIAS___asg.name
 }}
 
@@ -130,11 +140,15 @@ resource "aws_autoscaling_schedule" "__TF_ALIAS___scale_up" {{
             confidence=Confidence.HIGH,
             reasoning="Workload maps perfectly to business hours. Wrapping in an ASG with cron-based scaling automates shutdowns safely.",
             blast_radius_assessment="LOW - Wrapping a single instance in an ASG requires minimal configuration.",
-            estimated_monthly_savings=40.0, # Saving ~65% by turning off nights and weekends
-            terraform_hcl_diff=hcl_diff.strip(),
-            system_tasks=[]
+            estimated_monthly_savings=40.0,  # Saving ~65% by turning off nights and weekends
+            hcl_edits=[HCLEdit(
+                edit_type="replace_resource",
+                resource_address="__TF_ADDRESS__",
+                full_resource_hcl=hcl_diff.strip(),
+            )],
+            system_tasks=[],
         )
-    
+
     if pattern == WorkloadPattern.ALWAYS_ON_IDLE:
         target_type = DOWNSIZE_MAP.get(instance_type)
         if target_type is None:
@@ -143,28 +157,28 @@ resource "aws_autoscaling_schedule" "__TF_ALIAS___scale_up" {{
                 confidence=Confidence.LOW,
                 reasoning=f"No safe downsize path mapped for {instance_type}.",
                 blast_radius_assessment="SAFE",
-                estimated_monthly_savings=0.0
-            )        
-        
+                estimated_monthly_savings=0.0,
+            )
+
         target_cost = EC2_MONTHLY_PRICING.get(target_type, 0.0)
         savings = current_cost - target_cost if current_cost and target_cost else 0.0
-        
-        hcl_diff = f"""
-        # Architectural Migration: Static Downsize
-resource "aws_instance" "__TF_ALIAS__" {{
-  instance_type = "{target_type}"
-}}
-        """
+
         return RuleResult(
-            action = Action.TIER_3_IAC,
+            action=Action.TIER_3_IAC,
             confidence=Confidence.HIGH,
             reasoning=f"Workload is consistently flat and over-provisioned. Downsizing to {target_type}.",
             blast_radius_assessment="MEDIUM - Requires instance reboot.",
             estimated_monthly_savings=savings,
-            terraform_hcl_diff=hcl_diff.strip()
-        )      
-    
-    #Catch All
+            hcl_edits=[HCLEdit(
+                edit_type="update_attribute",
+                resource_address="__TF_ADDRESS__",
+                attribute_path="instance_type",
+                old_value=instance_type,
+                new_value=target_type,
+            )],
+        )
+
+    # Catch All
     return RuleResult(
         Action.IGNORE, Confidence.HIGH, "Resource is active and appropriately provisioned.", "SAFE", 0.0
     )
