@@ -7,6 +7,12 @@ text/regex pattern matching -- NO python-hcl2 / AST. The edit is a "drop-in
 and replace on the text": locate the `resource "type" "name" { ... }` block
 by regex and surgically rewrite, remove, append, or replace it.
 
+The updated main.tf is written back to the tenant config bucket
+(s3://${CONFIG_BUCKET}/${tenant_id}/main.tf) and a CodeBuild *plan-only* run is
+triggered (APPLY=false). The finding is moved to PENDING_APPROVAL; the actual
+apply happens later via the approve API. The CodeBuild env contract matches
+buildspec.yml.
+
 Placeholders emitted by the rules engine are resolved here:
   __TF_ADDRESS__ -> real terraform address from the STATEADDR# map
   __TF_ALIAS__   -> the label segment of that address (for naming new resources)
@@ -26,10 +32,10 @@ s3 = boto3.client('s3')
 codebuild = boto3.client('codebuild')
 dynamodb = boto3.resource('dynamodb')
 
-TF_BUCKET = os.environ.get('TENANT_TF_BUCKET', 'cloudoptix-tenant-tf')
+CONFIG_BUCKET = os.environ.get('CONFIG_BUCKET', 'cloudoptix-tenant-configs')
+STATE_BUCKET = os.environ.get('STATE_BUCKET', '')
 TABLE_NAME = os.environ.get('DYNAMODB_TABLE_NAME', 'cloudoptix-core-table')
 CODEBUILD_PROJECT = os.environ.get('CODEBUILD_PROJECT_NAME', 'CloudOptix-Terraform-Runner')
-TFSTATE_BUCKET = os.environ.get('TENANT_TFSTATE_BUCKET', '')
 
 table = dynamodb.Table(TABLE_NAME)  # type: ignore
 
@@ -69,13 +75,13 @@ def lambda_handler(event, context):
 
             if not resolved_edits:
                 logger.warning(f"No applicable edits for finding {finding_id} (unmapped resource).")
-                _update_finding_status(tenant_id, finding_id, 'SKIPPED_UNMAPPED')
+                _update_finding_status(tenant_id, finding_id, 'SKIPPED_UNMAPPED', skipped=skipped)
                 continue
 
             # Read current main.tf (may not exist yet for a fresh workspace).
-            workspace_key = f"{tenant_id}/main.tf"
+            config_key = f"{tenant_id}/main.tf"
             try:
-                obj = s3.get_object(Bucket=TF_BUCKET, Key=workspace_key)
+                obj = s3.get_object(Bucket=CONFIG_BUCKET, Key=config_key)
                 tf_content = obj['Body'].read().decode('utf-8')
             except s3.exceptions.NoSuchKey:
                 logger.warning(f"main.tf not found for {tenant_id}; initializing empty.")
@@ -89,19 +95,30 @@ def lambda_handler(event, context):
                 continue
 
             s3.put_object(
-                Bucket=TF_BUCKET,
-                Key=workspace_key,
+                Bucket=CONFIG_BUCKET,
+                Key=config_key,
                 Body=new_tf_content.encode('utf-8'),
             )
-            logger.info(f"Updated main.tf for {tenant_id}. Triggering terraform plan.")
+            logger.info(f"Updated main.tf for {tenant_id}. Triggering terraform plan (preview only).")
+
+            # Tenant execution context for the CodeBuild runner.
+            profile = table.get_item(
+                Key={'PK': f"TENANT#{tenant_id}", 'SK': "PROFILE"}
+            ).get('Item', {})
+            tenant_role_arn = profile.get('TenantRoleArn', '')
+            region = profile.get('TargetRegion', 'ap-northeast-1')
 
             build = codebuild.start_build(
                 projectName=CODEBUILD_PROJECT,
                 environmentVariablesOverride=[
                     {'name': 'TENANT_ID', 'value': tenant_id, 'type': 'PLAINTEXT'},
                     {'name': 'ACTION_ID', 'value': finding_id, 'type': 'PLAINTEXT'},
-                    {'name': 'TF_BUCKET', 'value': TF_BUCKET, 'type': 'PLAINTEXT'},
-                    {'name': 'TFSTATE_BUCKET', 'value': TFSTATE_BUCKET, 'type': 'PLAINTEXT'},
+                    {'name': 'CONFIG_BUCKET', 'value': CONFIG_BUCKET, 'type': 'PLAINTEXT'},
+                    {'name': 'CONFIG_KEY', 'value': config_key, 'type': 'PLAINTEXT'},
+                    {'name': 'STATE_BUCKET', 'value': STATE_BUCKET, 'type': 'PLAINTEXT'},
+                    {'name': 'TENANT_ROLE_ARN', 'value': tenant_role_arn, 'type': 'PLAINTEXT'},
+                    {'name': 'RESOURCE_ID', 'value': resource_id, 'type': 'PLAINTEXT'},
+                    {'name': 'AWS_REGION', 'value': region, 'type': 'PLAINTEXT'},
                     {'name': 'APPLY', 'value': 'false', 'type': 'PLAINTEXT'},
                 ],
             )

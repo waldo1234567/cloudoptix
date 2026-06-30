@@ -42,6 +42,18 @@ resource "aws_iam_role_policy" "worker_lambda_permissions" {
         Resource = aws_sns_topic.alerts.arn
       },
       {
+        Action   = "codebuild:StartBuild"
+        Effect   = "Allow"
+        Resource = aws_codebuild_project.terraform_runner.arn
+      },
+      {
+        Action = ["s3:GetObject", "s3:PutObject"]
+        Effect = "Allow"
+        Resource = [
+          "${aws_s3_bucket.tenant_configs.arn}/*"
+        ]
+      },
+      {
         Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
         Effect   = "Allow"
         Resource = "arn:aws:logs:*:*:*"
@@ -119,6 +131,26 @@ resource "aws_lambda_function" "rules_engine" {
 
 }
 
+resource "aws_lambda_function" "hcl_writer" {
+  filename         = data.archive_file.backend_zip.output_path
+  source_code_hash = data.archive_file.backend_zip.output_base64sha256
+  function_name    = "CloudOptix-HCL-Writer"
+  role             = aws_iam_role.worker_lambda_role.arn
+  handler          = "lambdas.hcl_writer.handler.lambda_handler"
+  runtime          = "python3.11"
+  timeout          = 120
+  memory_size      = 512
+
+  environment {
+    variables = {
+      DYNAMODB_TABLE_NAME    = aws_dynamodb_table.cloudoptix_table.name
+      CONFIG_BUCKET          = aws_s3_bucket.tenant_configs.bucket
+      STATE_BUCKET           = aws_s3_bucket.tenant_tfstate.bucket
+      CODEBUILD_PROJECT_NAME = aws_codebuild_project.terraform_runner.name
+    }
+  }
+}
+
 resource "aws_lambda_function" "probe_executor" {
   filename         = data.archive_file.backend_zip.output_path
   source_code_hash = data.archive_file.backend_zip.output_base64sha256
@@ -185,7 +217,7 @@ resource "aws_iam_role_policy_attachment" "action_sqs_trigger" {
 
 resource "aws_lambda_event_source_mapping" "action_queue_trigger" {
   event_source_arn = aws_sqs_queue.action_queue.arn
-  function_name    = aws_lambda_function.probe_executor.arn
+  function_name    = aws_lambda_function.hcl_writer.arn
   batch_size       = 1
 
   depends_on = [aws_iam_role_policy_attachment.action_sqs_trigger]

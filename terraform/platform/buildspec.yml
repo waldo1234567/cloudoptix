@@ -39,8 +39,15 @@ phases:
 
   build:
     commands:
-      - echo "Executing terraform apply..."
-      - terraform apply -auto-approve -no-color
+      - echo "Generating terraform plan..."
+      - terraform plan -no-color -out=tfplan
+      - |
+        if [ "${APPLY}" = "true" ]; then
+          echo "APPLY=true -> executing terraform apply"
+          terraform apply -no-color -auto-approve tfplan
+        else
+          echo "APPLY=false -> plan preview only. No changes applied."
+        fi
 
   post_build:
     commands:
