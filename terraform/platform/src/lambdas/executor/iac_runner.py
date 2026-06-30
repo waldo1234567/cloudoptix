@@ -123,7 +123,8 @@ class AutonomusIaCEngine:
             {'name': 'CONFIG_BUCKET', 'value': self.config_bucket},
             {'name': 'CONFIG_KEY', 'value': s3_config_key},
             {'name': 'STATE_BUCKET', 'value': self.state_bucket},
-            {'name': 'AWS_REGION', 'value': self.region}
+            {'name': 'AWS_REGION', 'value': self.region},
+            {'name': 'APPLY', 'value': 'true'}
         ]
         
         response = self.codebuild.start_build(

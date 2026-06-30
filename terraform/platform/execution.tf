@@ -80,11 +80,12 @@ resource "aws_iam_role_policy" "api_lambda_permissions" {
     Version = "2012-10-17"
     Statement = [
       {
-        Action = ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:BatchGetItem"]
+        Action = ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:BatchGetItem", "dynamodb:Query", "dynamodb:UpdateItem"]
         Effect = "Allow"
         Resource = [
           aws_dynamodb_table.recommendations.arn,
-          aws_dynamodb_table.execution_history.arn
+          aws_dynamodb_table.execution_history.arn,
+          aws_dynamodb_table.cloudoptix_table.arn
         ]
       },
       {
@@ -112,19 +113,39 @@ data "archive_file" "backend_zip" {
   output_path = "${path.module}/backend_payload.zip"
 }
 
-resource "aws_lambda_function" "compiler_api" {
+resource "aws_lambda_function" "api_recommendations" {
   filename         = data.archive_file.backend_zip.output_path
   source_code_hash = data.archive_file.backend_zip.output_base64sha256
 
-  function_name = "CloudOptix-Compiler-API"
+  function_name = "CloudOptix-API-Recommendations"
   role          = aws_iam_role.api_lambda_role.arn
-  handler       = "lambdas.api.compiler.lambda_handler"
+  handler       = "lambdas.api.recommendations.lambda_handler"
   runtime       = "python3.11"
   timeout       = 30
 
   environment {
     variables = {
-      RECOMMENDATIONS_TABLE = aws_dynamodb_table.recommendations.name
+      DYNAMODB_TABLE_NAME = aws_dynamodb_table.cloudoptix_table.name
+    }
+  }
+}
+
+resource "aws_lambda_function" "api_approve" {
+  filename         = data.archive_file.backend_zip.output_path
+  source_code_hash = data.archive_file.backend_zip.output_base64sha256
+
+  function_name = "CloudOptix-API-Approve"
+  role          = aws_iam_role.api_lambda_role.arn
+  handler       = "lambdas.api.approve.lambda_handler"
+  runtime       = "python3.11"
+  timeout       = 30
+
+  environment {
+    variables = {
+      DYNAMODB_TABLE_NAME    = aws_dynamodb_table.cloudoptix_table.name
+      CONFIG_BUCKET          = aws_s3_bucket.tenant_configs.bucket
+      STATE_BUCKET           = aws_s3_bucket.tenant_tfstate.bucket
+      CODEBUILD_PROJECT_NAME = aws_codebuild_project.terraform_runner.name
     }
   }
 }

@@ -26,27 +26,50 @@ resource "aws_apigatewayv2_authorizer" "cognito_jwt" {
     }
 }
 
-resource "aws_apigatewayv2_integration" "compiler_integration" {
-  api_id = aws_apigatewayv2_api.http_api.id
-  integration_type = "AWS_PROXY"
-  integration_uri  = aws_lambda_function.compiler_api.invoke_arn
+resource "aws_apigatewayv2_integration" "recommendations_integration" {
+  api_id             = aws_apigatewayv2_api.http_api.id
+  integration_type   = "AWS_PROXY"
+  integration_uri    = aws_lambda_function.api_recommendations.invoke_arn
   integration_method = "POST"
 }
 
-resource "aws_apigatewayv2_route" "compiler_route" {
+resource "aws_apigatewayv2_route" "recommendations_route" {
   api_id    = aws_apigatewayv2_api.http_api.id
-  route_key = "POST /api/v1/compile"
-  
+  route_key = "GET /api/v1/tenants/{id}/recommendations"
+
   authorization_type = "JWT"
   authorizer_id      = aws_apigatewayv2_authorizer.cognito_jwt.id
-  target             = "integrations/${aws_apigatewayv2_integration.compiler_integration.id}"
+  target             = "integrations/${aws_apigatewayv2_integration.recommendations_integration.id}"
 }
 
-resource "aws_lambda_permission" "apigw_compiler" {
+resource "aws_lambda_permission" "apigw_recommendations" {
   action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.compiler_api.function_name
+  function_name = aws_lambda_function.api_recommendations.function_name
   principal     = "apigateway.amazonaws.com"
-  source_arn    = "${aws_apigatewayv2_api.http_api.execution_arn}/*/*/api/v1/compile"
+  source_arn    = "${aws_apigatewayv2_api.http_api.execution_arn}/*/*/api/v1/tenants/*/recommendations"
+}
+
+resource "aws_apigatewayv2_integration" "approve_integration" {
+  api_id             = aws_apigatewayv2_api.http_api.id
+  integration_type   = "AWS_PROXY"
+  integration_uri    = aws_lambda_function.api_approve.invoke_arn
+  integration_method = "POST"
+}
+
+resource "aws_apigatewayv2_route" "approve_route" {
+  api_id    = aws_apigatewayv2_api.http_api.id
+  route_key = "POST /api/v1/tenants/{id}/recommendations/{rec_id}/approve"
+
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito_jwt.id
+  target             = "integrations/${aws_apigatewayv2_integration.approve_integration.id}"
+}
+
+resource "aws_lambda_permission" "apigw_approve" {
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.api_approve.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.http_api.execution_arn}/*/*/api/v1/tenants/*/recommendations/*/approve"
 }
 
 
