@@ -1,10 +1,7 @@
-from dataclasses import asdict
-from datetime import datetime, timezone
 import json
 import os
 import logging
 from typing import Dict, Any, List
-import uuid
 from .models import Action, Confidence, RuleResult
 from boto3.dynamodb.conditions import Key
 from lambdas.metrics.classfier import classify_resource,WorkloadPattern
@@ -15,7 +12,7 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 dynamodb = boto3.resource('dynamodb')
-table = dynamodb.Table(os.environ.get('DYNAMODB_TABLE_NAME', 'cloudoptix-core-table')) # type: ignore
+table = dynamodb.Table(os.environ.get('DYNAMODB_TABLE_NAME', 'cloudoptix-core-table'))
 sqs = boto3.client('sqs')
 ACTION_QUEUE_URL = os.environ.get('ACTION_QUEUE_URL')
 
@@ -29,8 +26,8 @@ MODULE_MAP = {
     'table': dynamodb_rule,
     'cluster': elasticache,
     'service': ecs,       
-    'bucket': s3,
-    'eip': eip,
+    'bucket': s3,         
+    'eipalloc': eip,      
     'filesystem': efs
 }
 
@@ -54,16 +51,11 @@ def lambda_handler(event, context):
             
             rule_result = evaluate_resource(resource_data)
             
-            if rule_result.action != Action.IGNORE:
-                finding_id = f"f-{uuid.uuid4().hex[:8]}"
-                logger.info(f"Action {rule_result.action.value} queued for {res_id}.")
+            if rule_result.action not in [Action.IGNORE]:
+                logger.info(f"Action {rule_result.action} required for {res_id}. Pushing to Action Queue.")
                 
-                hcl_edits = getattr(rule_result, 'hcl_edits', None)
-                serialized_hcl_edits = [asdict(edit) for edit in hcl_edits] if hcl_edits else None
-
                 execution_payload = {
                     "tenant_id": tenant_id,
-                    "finding_id" : finding_id,
                     "tenant_role_arn": tenant_role_arn,
                     "region": region,
                     "sns_topic_arn": sns_topic_arn,
@@ -72,34 +64,16 @@ def lambda_handler(event, context):
                     "rule_result": {
                         "action": rule_result.action.value,
                         "system_tasks": getattr(rule_result, 'system_tasks', []),
-                        "hcl_edits": serialized_hcl_edits,
+                        "validation_endpoint": getattr(rule_result, 'validation_endpoint', None),
+                        "terraform_hcl_diff": getattr(rule_result, 'terraform_hcl_diff', None),
                         "reasoning": getattr(rule_result, 'reasoning', None),
                         "estimated_monthly_savings": getattr(rule_result, 'estimated_monthly_savings', 0.0)
                     }
                 }
                 
-                message_payload = {
-                    "tenant_id": tenant_id,
-                    "finding_id" : finding_id,
-                    "resource_id": res_id,
-                }
-                
-                logger.info("Pushing to dynamodb ...")
-                
-                publish_finding_to_db(
-                    tenant_id=tenant_id,
-                    resource_id=res_id,
-                    resource_type=res_type,
-                    finding_id=finding_id,
-                    rule_result=rule_result,
-                    execution_payload=execution_payload
-                )
-                
-                logger.info("Push to DB done, now to sqs")
-                
                 sqs.send_message(
                     QueueUrl=ACTION_QUEUE_URL,
-                    MessageBody=json.dumps(message_payload),
+                    MessageBody=json.dumps(execution_payload),
                     MessageGroupId=f"{tenant_id}-{res_id}"
                 )
     
@@ -161,22 +135,3 @@ def _get_tenant_resources(tenant_id: str) -> List[Dict[str, Any]]:
         if 'LastEvaluatedKey' not in response: break
         kwargs['ExclusiveStartKey'] = response['LastEvaluatedKey']
     return items
-
-def publish_finding_to_db(tenant_id, resource_id, resource_type, finding_id ,rule_result, execution_payload):
-
-    terraform_edits = execution_payload.get('rule_result', {}).get('hcl_edits') or []
-
-    table.put_item(Item={
-        'PK': f"TENANT#{tenant_id}",
-        'SK': f"FINDING#{finding_id}",
-        'ResourceId': resource_id,
-        'ResourceType': resource_type,
-        'Status': 'NEW',
-        'Action': rule_result.action.value,
-        'Reasoning': rule_result.reasoning or 'Optimization recommended.',
-        'EstimatedSavings': str(rule_result.estimated_monthly_savings or '0.00'),
-        'TerraformEdits': terraform_edits,
-        'CreatedAt': datetime.now(timezone.utc).isoformat()
-    })
-  
-    return finding_id

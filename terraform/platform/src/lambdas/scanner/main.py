@@ -87,7 +87,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     "ResourceType": res.resource_type,
                     "Service": res.service,
                     "Arn": res.arn,
-                    "RawMetadata": res.raw_metadata,
+                    "Configuration": res.raw_metadata,
                     "Tags": res.tags,
                     "Region": res.region,
                     "AccountId": res.account_id,

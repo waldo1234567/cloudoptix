@@ -158,24 +158,13 @@ def build_edges(resources: List[Dict[str, Any]]) -> List[tuple]:
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
-    Triggered by SQS after the inventory scan completes.
+    Triggered by SQS or Step Functions after the inventory scan completes.
     """
-    records = event.get('Records', [])
-    if not records:
-        logger.error("No SQS records found in event.")
-        return {"statusCode": 400, "status": "NO_RECORDS"}
-
-    body = json.loads(records[0]['body'])
-    tenant_id = body.get('tenant_id')
-    if not tenant_id:
-        logger.error("No tenant_id found in SQS message body.")
-        return {"statusCode": 400, "status": "NO_TENANT"}
-
-    profile = table.get_item(Key={'PK': f"TENANT#{tenant_id}", 'SK': 'PROFILE'}).get('Item', {})
-    region = profile.get('TargetRegion', 'ap-northeast-1')
-    role_arn = profile.get('TenantRoleArn', 'arn:aws:iam::123456789012:role/CloudOptix-Tenant-Deployment-Role')
-    external_id = profile.get('ExternalId', 'ext-uuid')
-
+    tenant_id = event['tenant_id']
+    region = event['region']
+    role_arn = event['role_arn']
+    external_id = event['external_id']
+    
     logger.info(f"Starting Graph Traversal for Tenant: {tenant_id}")
     
     resources = get_tenant_resources(tenant_id)
