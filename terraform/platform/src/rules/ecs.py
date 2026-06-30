@@ -5,7 +5,6 @@ from lambdas.metrics.classfier import WorkloadPattern
 
 logger = logging.getLogger(__name__)
 
-
 def evaluate(resource: Dict[str, Any], metrics: Dict[str, Any], workload_pattern: str) -> RuleResult:
     meta = resource.get('RawMetadata', {})
     service_name = resource.get('SK', '').split('RESOURCE#')[-1]

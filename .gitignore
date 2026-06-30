@@ -3,6 +3,7 @@
 
 .env
 
-pycache/
+__pycache__/
+*.pyc
 
 .terrform.lock.hcl
