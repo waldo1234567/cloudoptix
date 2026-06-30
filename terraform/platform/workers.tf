@@ -54,6 +54,11 @@ resource "aws_iam_role_policy" "worker_lambda_permissions" {
         ]
       },
       {
+        Action   = ["s3:GetObject"]
+        Effect   = "Allow"
+        Resource = "${aws_s3_bucket.tenant_tfstate.arn}/*"
+      },
+      {
         Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
         Effect   = "Allow"
         Resource = "arn:aws:logs:*:*:*"
@@ -166,6 +171,43 @@ resource "aws_lambda_function" "probe_executor" {
       SNS_TOPIC_ARN       = aws_sns_topic.alerts.arn
     }
   }
+}
+
+resource "aws_lambda_function" "state_parser" {
+  filename         = data.archive_file.backend_zip.output_path
+  source_code_hash = data.archive_file.backend_zip.output_base64sha256
+  function_name    = "CloudOptix-State-Parser"
+  role             = aws_iam_role.worker_lambda_role.arn
+  handler          = "lambdas.parser.handler.lambda_handler"
+  runtime          = "python3.11"
+  timeout          = 120
+  memory_size      = 512
+
+  environment {
+    variables = {
+      DYNAMODB_TABLE_NAME = aws_dynamodb_table.cloudoptix_table.name
+    }
+  }
+}
+
+resource "aws_lambda_permission" "allow_tfstate_invoke_parser" {
+  statement_id  = "AllowExecutionFromTfStateBucket"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.state_parser.function_name
+  principal     = "s3.amazonaws.com"
+  source_arn    = aws_s3_bucket.tenant_tfstate.arn
+}
+
+resource "aws_s3_bucket_notification" "tfstate_notification" {
+  bucket = aws_s3_bucket.tenant_tfstate.id
+
+  lambda_function {
+    lambda_function_arn = aws_lambda_function.state_parser.arn
+    events              = ["s3:ObjectCreated:*"]
+    filter_suffix       = ".tfstate"
+  }
+
+  depends_on = [aws_lambda_permission.allow_tfstate_invoke_parser]
 }
 
 resource "aws_lambda_function" "scheduler" {

@@ -151,21 +151,23 @@ resource "aws_lambda_function" "api_approve" {
 }
 
 
-resource "aws_lambda_function" "iac_runner" {
+resource "aws_lambda_function" "tenant_mgmt" {
   filename         = data.archive_file.backend_zip.output_path
   source_code_hash = data.archive_file.backend_zip.output_base64sha256
-  handler          = "lambdas.executor.iac_runner.lambda_handler"
-  function_name    = "CloudOptix-IaC-Runner"
-  role             = aws_iam_role.api_lambda_role.arn
-  runtime          = "python3.11"
-  timeout          = 30
+
+  function_name = "CloudOptix-Tenant-Mgmt"
+  role          = aws_iam_role.api_lambda_role.arn
+  handler       = "lambdas.tenant_mgmt.handler.lambda_handler"
+  runtime       = "python3.11"
+  timeout       = 30
 
   environment {
     variables = {
-      CONFIG_BUCKET     = aws_s3_bucket.tenant_configs.bucket
-      STATE_BUCKET      = aws_s3_bucket.tenant_tfstate.bucket
-      CODEBUILD_PROJECT = aws_codebuild_project.terraform_runner.name
-      HISTORY_TABLE     = aws_dynamodb_table.execution_history.name
+      DYNAMODB_TABLE_NAME = aws_dynamodb_table.cloudoptix_table.name
+      CONFIG_BUCKET       = aws_s3_bucket.tenant_configs.bucket
+      STATE_BUCKET        = aws_s3_bucket.tenant_tfstate.bucket
+      PLATFORM_ACCOUNT_ID = data.aws_caller_identity.current.account_id
     }
   }
 }
+

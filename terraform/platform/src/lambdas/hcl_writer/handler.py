@@ -114,7 +114,6 @@ def lambda_handler(event, context):
                     {'name': 'TENANT_ID', 'value': tenant_id, 'type': 'PLAINTEXT'},
                     {'name': 'ACTION_ID', 'value': finding_id, 'type': 'PLAINTEXT'},
                     {'name': 'CONFIG_BUCKET', 'value': CONFIG_BUCKET, 'type': 'PLAINTEXT'},
-                    {'name': 'CONFIG_KEY', 'value': config_key, 'type': 'PLAINTEXT'},
                     {'name': 'STATE_BUCKET', 'value': STATE_BUCKET, 'type': 'PLAINTEXT'},
                     {'name': 'TENANT_ROLE_ARN', 'value': tenant_role_arn, 'type': 'PLAINTEXT'},
                     {'name': 'RESOURCE_ID', 'value': resource_id, 'type': 'PLAINTEXT'},
