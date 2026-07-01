@@ -134,11 +134,15 @@ def _register_tenant(event):
 
 
 def _scaffold_workspace(tenant_id, account_id, region, tenant_role_arn, external_id, onboarding_path):
-    # The CloudOptix CodeBuild runner assumes the tenant role and injects
-    # temporary credentials into the environment, so the provider uses those
-    # ambient credentials directly (no assume_role here, to avoid a double hop).
+    # Cross-account model: the CodeBuild backend runs as the platform role, and
+    # the provider assumes the tenant role for resource operations.
     providers_tf = f'''provider "aws" {{
   region = var.region
+
+  assume_role {{
+    role_arn    = "{tenant_role_arn}"
+    external_id = "{external_id}"
+  }}
 }}
 '''
 
