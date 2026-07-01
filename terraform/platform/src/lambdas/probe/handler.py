@@ -1,396 +1,492 @@
+"""
+CloudOptix Probe (V2 — post-apply validator).
+
+In V1 the probe executed tier actions directly (stop/terminate/delete via the
+AWS API). In the V2 Terraform-first model, all mutation happens through
+terraform apply, so the probe is repurposed for VALIDATION ONLY: after an apply
+succeeds it assumes the tenant role and health-checks the affected resource to
+confirm the architecture survived the change, then records a verdict.
+
+Invoked asynchronously by build_monitor after a successful apply build with:
+    {"tenant_id": ..., "finding_id": ..., "resource_id": ...}
+
+Outcome:
+    VALIDATED           health checks passed
+    VALIDATION_FAILED   checks failed -> SNS alert (rollback is a future step)
+"""
 import os
-import time
 import json
-import boto3
+import time
 import logging
 import urllib.request
-from typing import Dict, Any, List, Optional
+import urllib.error
 from datetime import datetime, timezone
-from botocore.exceptions import ClientError, WaiterError
+
+import boto3
+from botocore.exceptions import ClientError
+from lambdas.scanner.auth import assume_tenant_role
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-class ExecutionEngine:
-    def __init__(self, tenant_id: str, tenant_role_arn: str, region: str, sns_topic_arn: str, external_id: str):
-        self.tenant_id = tenant_id
-        self.region = region
-        self.sns_topic_arn = sns_topic_arn
-        self.tenant_role_arn = tenant_role_arn
-        
-        sts_client = boto3.client('sts')
-        try:
-            assumed_role = sts_client.assume_role(
-                RoleArn=tenant_role_arn,
-                RoleSessionName=f"CloudOptixExec-{tenant_id}",
-                ExternalId=external_id,
-                DurationSeconds=900 
-            )
-            credentials = assumed_role['Credentials']
+dynamodb = boto3.resource('dynamodb')
+sns = boto3.client('sns')
+s3 = boto3.client('s3')
+codebuild = boto3.client('codebuild')
 
-            tenant_session = {
-                'aws_access_key_id': credentials['AccessKeyId'],
-                'aws_secret_access_key': credentials['SecretAccessKey'],
-                'aws_session_token': credentials['SessionToken'],
-                'region_name': region
-            }
-            
-            self.ec2 = boto3.client('ec2', **tenant_session)
-            self.rds = boto3.client('rds', **tenant_session)
-            self.backup = boto3.client('backup', **tenant_session)
-            self.cloudwatch = boto3.client('cloudwatch', **tenant_session)
-            
-            self.sns = boto3.client('sns', region_name=region)
-        
-        except ClientError as e:
-            logger.critical(f"STS Authentication failed for Tenant {tenant_id}: {e}")
-            raise Exception("Authentication Failure. Cannot execute actions.")
-        
-        self.ACTION_REGISTRY = {
-            'TIER_1_STOP':    self._handle_tier_1_stop,
-            'TIER_1_DELETE':  self._handle_tier_1_delete,
-            'TIER_1_RELEASE': self._handle_tier_1_release,
-            'TIER_3_IAC':     self._handle_tier_3_iac,
-        }
-        
-    def execute_rule_result(self, resource_id: str, resource_type: str, rule_result: Dict[str, Any])-> Dict[str, Any]:
-        action = rule_result.get('action')
-        tasks = rule_result.get('system_tasks', [])
-        
-        logger.info(f"Probe action execution starting: action={action}, resource_id={resource_id}, resource_type={resource_type}")
-        task_state = {}
-        if tasks:
-            task_state = self._execute_system_tasks(tasks, resource_id)
-            if task_state.get('status') == 'FAILED': # type: ignore
-                logger.error(f"Pre-flight task failed for {resource_id}. Aborting execution.")
-                return task_state
-        
-        handler = self.ACTION_REGISTRY.get(action)
-        if not handler:
-            msg = f"No execution handler registered for action: {action}"
-            logger.error(msg)
-            return {"status": "FAILED", "message": msg}
+TABLE_NAME = os.environ.get('DYNAMODB_TABLE_NAME', 'cloudoptix-core-table')
+SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN')
+CONFIG_BUCKET = os.environ.get('CONFIG_BUCKET', '')
+STATE_BUCKET = os.environ.get('STATE_BUCKET', '')
+CODEBUILD_PROJECT = os.environ.get('CODEBUILD_PROJECT_NAME', 'CloudOptix-Terraform-Runner')
+ROLLBACK_ENABLED = os.environ.get('ROLLBACK_ENABLED', 'true') == 'true'
+table = dynamodb.Table(TABLE_NAME)  # type: ignore
 
-        return handler(resource_id, resource_type, rule_result, task_state)
 
-    def _poll_with_timeout(self, check_fn, pass_condition_fn, timeout_seconds: int = 300 , interval_seconds: int = 15, context:str = "") -> bool:
-        attempts = timeout_seconds // interval_seconds
-        for attempt in range(attempts):
-            try:
-                result = check_fn()
-                if pass_condition_fn(result):
-                    logger.info(f"Probe PASSED on attempt {attempt + 1}. Context: {context}")
-                    return True
-            except Exception as e:
-                logger.warning(f"Probe attempt {attempt + 1} error: {e}. Context: {context}")
-            time.sleep(interval_seconds)
-        logger.error(f"Probe TIMEOUT after {timeout_seconds}s. Context: {context}")
-        return False
-    
-    def _synthetic_http_probe(self, endpoint_url: str) -> bool:
-        logger.info(f"Initiating synthetic HTTP probe: {endpoint_url}")
-        for attempt in range(20):
-            try:
-                req = urllib.request.Request(endpoint_url, method="GET")
-                with urllib.request.urlopen(req, timeout = 5) as response:
-                    if response.status in [200, 201, 202]:
-                        logger.info("Probe SUCCESS.")
-                        return True
-            
-            except Exception as e:
-                logger.warning(f"Probe attempt {attempt + 1} failed: {e}")
-            time.sleep(15)
-        logger.error("Probe TIMEOUT.")
-        return False
-    
-    def _execute_system_tasks(self, tasks: List[Dict[str, Any]], resource_id: str) -> Dict[str, Any]:
-        state = {"status": "SUCCESS"}
-        for task in tasks:
-            task_type = task.get('type')
-            
-            if task_type in ['START_BACKUP_JOB', 'CREATE_SNAPSHOT']:
-                vol_id = task.get('volume_id', resource_id)
-                try:
-                    logger.info(f"Creating pre-flight snapshot for volume {vol_id}")
-                    snap = self.ec2.create_snapshot(VolumeId=vol_id, Description=f"CloudOptix Auto-Backup {vol_id}")
-                    snap_id = snap['SnapshotId']
+# ── Resource-type validators: (clients, resource_id, finding) -> (ok, detail) ──
 
-                    waiter = self.ec2.get_waiter('snapshot_completed')
-                    waiter.wait(SnapshotIds=[snap_id], WaiterConfig={'Delay': 15, 'MaxAttempts': 40})
-                    
-                    state['snapshot_id'] = snap_id
-                    logger.info(f"Snapshot {snap_id} verified complete.")
-                    
-                except Exception as e:
-                    logger.error(f"Pre-flight snapshot failed: {e}")
-                    return {"status": "FAILED", "message": str(e)}
-        return state
-    
-    def _handle_tier_3_iac(self, resource_id: str, resource_type: str, rule_result: Dict, task_state: Dict) -> Dict:
-        hcl_diff = rule_result.get('terraform_hcl_diff', 'No HCL provided.')
-        reasoning = rule_result.get('reasoning', 'No reasoning provided.')
-        savings = rule_result.get('estimated_monthly_savings', 0.0)
-        
-        logger.info(f"\n=====================================")
-        logger.info(f"GENERATED IAC FOR {resource_id}")
-        logger.info(f"Reason: {reasoning}")
-        logger.info(f"Savings: ${savings}/mo")
-        logger.info(f"{hcl_diff}")
-        logger.info(f"=====================================\n")
-        
-        try:
-            dynamodb = boto3.resource('dynamodb', region_name=self.region)
-            table = dynamodb.Table(os.environ.get('DYNAMODB_TABLE_NAME', 'cloudoptix-core-table')) # type: ignore
-            table.put_item(
-                Item={
-                    'PK': f"TENANT#{self.tenant_id}",
-                    'SK': f"FINDING#{resource_id}",
-                    'Type': 'Recommendation',
-                    'ResourceId': resource_id,
-                    'ResourceType': resource_type,
-                    'Action': 'TIER_3_IAC',
-                    'Reasoning': reasoning,
-                    'EstimatedMonthlySavings': str(savings), 
-                    'TerraformHCL': hcl_diff,
-                    'Status': 'PENDING_APPROVAL',
-                    'Timestamp': datetime.now(timezone.utc).isoformat()
-                }
-            )
-            return {"status": "SUCCESS", "message": "IaC generated and saved to DynamoDB database."}
-        except Exception as e:
-            logger.error(f"Failed to save finding to DynamoDB: {e}")
-            return {"status": "FAILED", "message": f"Failed to save finding: {e}"}
-    
-    def _handle_tier_1_delete(self, resource_id: str, resource_type: str, rule_result: Dict, task_state: Dict) -> Dict:
-        if resource_type == 'volume':
-            return self._delete_ebs_volume(resource_id, task_state)
-        elif resource_type == 'natgateway':
-            return self._delete_nat_gateway(resource_id)
-        else:
-            return {"status": "FAILED", "message": f"TIER_1_DELETE not supported for resource_type={resource_type}."}
-    
-    def _handle_tier_1_stop(self, resource_id: str, resource_type: str, rule_result: Dict, task_state: Dict) -> Dict:
-        if resource_type != 'instance': return {"status": "FAILED", "message": "Stop requires instance."}
-        logger.info(f"[{resource_id}] Initiating TIER_1_STOP.")
-        try:
-            self.ec2.stop_instances(InstanceIds=[resource_id])
-            
-            waiter = self.ec2.get_waiter('instance_stopped')
-            waiter.wait(InstanceIds=[resource_id], WaiterConfig={'Delay': 15, 'MaxAttempts': 20})
-            
-            logger.info(f"[{resource_id}] Instance stopped successfully.")
-            return {"status": "STOPPED", "message": f"Instance {resource_id} stopped."}
+def _validate_instance(clients, resource_id, finding):
+    action = finding.get('Action')
+    resp = clients['ec2'].describe_instance_status(InstanceIds=[resource_id], IncludeAllInstances=True)
+    statuses = resp.get('InstanceStatuses', [])
+    if not statuses:
+        return False, f"instance {resource_id} not found"
+    st = statuses[0]
+    state = st['InstanceState']['Name']
 
-        except WaiterError:
-            return self._rollback_ec2_stop(resource_id, rule_result.get('validation_endpoint'), "Instance failed to reach STOPPED state within 5 minutes.")
-        except Exception as e:
-            return self._rollback_ec2_stop(resource_id, rule_result.get('validation_endpoint'), str(e))
-        
-    def _rollback_ec2_stop(self, instance_id: str, validation_url: Optional[str], reason: str) -> Dict[str, Any]:
-        logger.warning(f"ROLLBACK EC2: {instance_id}. Reason: {reason}")
-        try:
-            self.ec2.start_instances(InstanceIds=[instance_id])
-            waiter = self.ec2.get_waiter('instance_running')
-            waiter.wait(InstanceIds=[instance_id], WaiterConfig={'Delay': 15, 'MaxAttempts': 40})
-            
-            if validation_url:
-                if not self._synthetic_http_probe(validation_url):
-                    self._trigger_sns_escalation(
-                        instance_id, "ROLLBACK_DEGRADED",
-                        f"Instance restarted but HTTP probe failed. Original stop reason: {reason}"
-                    )
-                    return {"status": "ROLLBACK_DEGRADED", "message": "Instance running but application health check failed."}
-            
-            self._trigger_sns_escalation(instance_id, "TIER_1_STOP", reason)
-            return {"status": "ROLLED_BACK", "message": f"Reversed. {reason}"}
-        except Exception as e:
-            return {"status": "ROLLBACK_FAILED", "message": str(e)}
-    
-    def _delete_ebs_volume(self, volume_id: str, task_state: Dict) -> Dict[str, Any]:
-        snapshot_id = task_state.get('snapshot_id')
-        if not snapshot_id:
-            return {"status": "FAILED", "message": "Pre-flight snapshot not verified. Aborting delete to protect data."}
- 
-        try:
-            self.ec2.delete_volume(VolumeId=volume_id)
-            logger.info(f"[{volume_id}] Volume deleted. Backup: {snapshot_id}.")
-            return {"status": "DELETED", "message": f"Volume {volume_id} deleted. Backup verified in snapshot {snapshot_id}."}
-        except ClientError as e:
-            self._trigger_sns_escalation(
-                volume_id, "TIER_1_DELETE_FAILED",
-                f"Delete failed — volume still intact. Backup available at {snapshot_id}. Error: {str(e)}"
-            )
-            return {"status": "ESCALATED", "message": f"Delete failed. Volume still intact. Backup at {snapshot_id}."}
-    
-    def _delete_nat_gateway(self, nat_id: str) -> Dict[str, Any]:
-        try:
-            self.ec2.delete_nat_gateway(NatGatewayId=nat_id)
-            logger.info(f"[{nat_id}] Delete request issued. Polling for confirmation.")
-            
-            passed = self._poll_with_timeout(
-                check_fn=lambda: self.ec2.describe_nat_gateways(NatGatewayIds=[nat_id])['NatGateways'][0]['State'],
-                pass_condition_fn=lambda state: state == 'deleted',
-                timeout_seconds=300,
-                context=f"NAT Gateway {nat_id} deletion"
-            )
-            
-            if passed:
-                logger.info(f"[{nat_id}] NAT Gateway confirmed deleted.")
-                return {"status": "DELETED", "message": f"NAT Gateway {nat_id} deleted. Saving ~$32.50/month."}
-            else:
-                self._trigger_sns_escalation(
-                    nat_id, "NAT_DELETE_TIMEOUT",
-                    "NAT Gateway delete issued but did not confirm 'deleted' state within 300s. Verify manually."
-                )
-                return {"status": "ESCALATED", "message": "Delete issued but state confirmation timed out. Manual verification required."}
-        
-        except ClientError as e:
-            self._trigger_sns_escalation(nat_id, "NAT_DELETE_FAILED", str(e))
-            return {"status": "FAILED", "message": str(e)}
-        
-    def _handle_tier_1_release(self, resource_id: str, resource_type: str, rule_result: Dict, task_state: Dict) -> Dict:
-        if resource_type != 'eip':
-            return {"status": "FAILED", "message": f"TIER_1_RELEASE requires resource_type=eip, got {resource_type}."}
-        
-        try:
-            self.ec2.release_address(AllocationId = resource_id)
-            logger.info(f"[{resource_id}] EIP released successfully.")
-            return {"status": "RELEASED", "message": f"EIP {resource_id} released. No rollback possible — action is irreversible."}
+    # A stop recommendation is "healthy" when the instance actually stopped.
+    if action == 'TIER_1_STOP':
+        return state in ('stopped', 'stopping'), f"state={state} (expected stopped)"
 
-        except ClientError as e:
-            error_code = e.response['Error']['Code']
-            if error_code == 'AuthFailure':
-                return {"status": "FAILED", "message": "Insufficient permissions to release EIP."}
-            if error_code ==  'InvalidAllocationID.NotFound':
-                return {"status": "SKIPPED", "message": "EIP no longer exists — may have been released manually."}
-            self._trigger_sns_escalation(resource_id, "EIP_RELEASE_FAILED", str(e))
-            return {"status": "FAILED", "message": str(e)}
-    
-    def _handle_rds_stop(self, db_instance_id: str, rule_result: Dict) -> Dict[str,Any]:
-        logger.info(f"[{db_instance_id}] Initiating RDS stop.")
-        
-        try:
-            self.rds.stop_db_instance(DBInstanceIdentifier=db_instance_id)
-            
-            passed = self._poll_with_timeout(
-                check_fn=lambda: self.rds.describe_db_instances(DBInstanceIdentifier=db_instance_id)['DBInstances'][0]['DBInstanceStatus'],
-                pass_condition_fn=lambda status: status == 'stopped',
-                timeout_seconds=600,
-                context=f"RDS stop {db_instance_id}"
-            )
-            
-            if passed:
-                logger.info(f"[{db_instance_id}] RDS instance stopped successfully.")
-                return {"status": "STOPPED", "message": f"RDS instance {db_instance_id} stopped and confirmed."}
-            else:
-                return self._rollback_rds_stop(db_instance_id, "RDS instance failed to reach stopped state within 10 minutes.")
-        except ClientError as e:
-            return self._rollback_rds_stop(db_instance_id, str(e))
-    
-    def _rollback_rds_stop(self, db_instance_id: str, reason: str) -> Dict[str,Any]:
-        logger.warning(f"[{db_instance_id}] ROLLBACK RDS STOP. Reason: {reason}")
-        
-        try:
-            self.rds.start_db_instance(DBInstanceIdentifier=db_instance_id)
-            
-            self._poll_with_timeout(
-                check_fn=lambda: self.rds.describe_db_instances(DBInstanceIdentifier=db_instance_id)['DBInstances'][0]['DBInstanceStatus'],
-                pass_condition_fn=lambda status: status == 'available',
-                timeout_seconds=600,
-                context=f"RDS rollback start {db_instance_id}"
-            )
-            
-            passed = self._poll_with_timeout(
-                 check_fn=lambda: self.cloudwatch.get_metric_statistics(
-                    Namespace='AWS/RDS',
-                    MetricName='DatabaseConnections',
-                    Dimensions=[{'Name': 'DBInstanceIdentifier', 'Value': db_instance_id}],
-                    StartTime=datetime.now(timezone.utc).__class__.utcnow().__class__.utcnow(),
-                    EndTime=datetime.now(timezone.utc),
-                    Period=60,
-                    Statistics=['Maximum']
-                ).get('Datapoints', []),
-                pass_condition_fn=lambda points: any(p.get('Maximum', 0) > 0 for p in points),
-                timeout_seconds=600,
-                context=f"RDS connection probe {db_instance_id}"
-            )
+    sys_status = st.get('SystemStatus', {}).get('Status')
+    inst_status = st.get('InstanceStatus', {}).get('Status')
+    ok = state == 'running' and sys_status in ('ok', 'initializing') and inst_status in ('ok', 'initializing')
+    return ok, f"state={state} system={sys_status} instance={inst_status}"
 
-            if not passed:
-                self._trigger_sns_escalation(
-                    db_instance_id, "RDS_ROLLBACK_DEGRADED",
-                    f"RDS restarted but no connections re-established within 10 minutes. Original reason: {reason}"
-                )
-                return {"status": "ROLLBACK_DEGRADED", "message": "RDS running but no connections confirmed."}
 
-            self._trigger_sns_escalation(db_instance_id, "RDS_STOP_ROLLED_BACK", reason)
-            return {"status": "ROLLED_BACK", "message": f"RDS stop reversed. Reason: {reason}"}
-        
-        except Exception as e:
-            self._trigger_sns_escalation(db_instance_id, "RDS_ROLLBACK_FAILED", f"CRITICAL: {e}")
-            return {"status": "ROLLBACK_FAILED", "message": str(e)}
-    
-    
-    
-    def _trigger_sns_escalation(self, resource_id: str, event_type: str, reason: str):
-        payload = {
-            "event":       event_type,
-            "severity":    "CRITICAL",
-            "tenant_id":   self.tenant_id,
-            "resource_id": resource_id,
-            "reason":      reason,
-            "timestamp":   datetime.now(timezone.utc).isoformat()
-        }
-        try:
-            self.sns.publish(
-                TopicArn=self.sns_topic_arn,
-                Subject=f"CloudOptix Escalation: {event_type}",
-                Message=json.dumps(payload)
-            )
-        except Exception as e:
-             logger.critical(f"SNS escalation FAILED for {resource_id}: {e}. Original event: {event_type} — {reason}")
-
-def _route_tier_1_stop(engine: 'ExecutionEngine', resource_id: str, resource_type: str, rule_result: Dict, task_state: Dict) -> Dict:
-    if resource_type == 'instance':
-        return engine._handle_tier_1_stop(resource_id, resource_type, rule_result, task_state)
-    elif resource_type == 'db-instance':
-        return engine._handle_rds_stop(resource_id, rule_result)
-    else:
-        return {"status": "FAILED", "message": f"TIER_1_STOP not supported for resource_type={resource_type}."}
-
-    
-def lambda_handler(event, context):
-    logger.info(f"Probe lambda invoked with event: {event}")
-    records = event.get("Records", [])
-    if not records:
-        raise ValueError("No SQS record found")
-    
-    record = records[0]
-    logger.info(f"Probe received SQS record: {record}")
-    
+def _validate_db(clients, resource_id, finding):
     try:
-        body = json.loads(record["body"])
-        logger.info(f"Probe parsed message body: {body}")
-        engine = ExecutionEngine(
-            tenant_id=body['tenant_id'],
-            tenant_role_arn=body['tenant_role_arn'],
-            region=body['region'],
-            sns_topic_arn=body['sns_topic_arn'],
-            external_id=body.get('external_id', 'cloudoptix-ext-test-001')
+        resp = clients['rds'].describe_db_instances(DBInstanceIdentifier=resource_id)
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'DBInstanceNotFound':
+            # If the finding removed the DB, absence is the desired end state.
+            if finding.get('Action') in ('TIER_1_DELETE',):
+                return True, "db instance removed as intended"
+            return False, f"db instance {resource_id} not found"
+        raise
+    status = resp['DBInstances'][0]['DBInstanceStatus']
+    return status == 'available', f"status={status}"
+
+
+def _validate_loadbalancer(clients, resource_id, finding):
+    try:
+        tgs = clients['elbv2'].describe_target_groups(LoadBalancerArn=resource_id).get('TargetGroups', [])
+    except ClientError as e:
+        return True, f"could not enumerate target groups ({e.response['Error']['Code']}); skipped"
+    if not tgs:
+        return True, "load balancer has no target groups"
+    healthy = 0
+    for tg in tgs:
+        th = clients['elbv2'].describe_target_health(
+            TargetGroupArn=tg['TargetGroupArn']
+        ).get('TargetHealthDescriptions', [])
+        healthy += sum(1 for t in th if t['TargetHealth']['State'] == 'healthy')
+    return healthy > 0, f"healthy_targets={healthy}"
+
+
+def _validate_generic(clients, resource_id, finding):
+    # No resource-specific health probe; a successful apply is the signal.
+    return True, f"no specific health probe for type '{finding.get('ResourceType')}'; assumed healthy"
+
+
+VALIDATORS = {
+    'instance': _validate_instance,
+    'db-instance': _validate_db,
+    'loadbalancer': _validate_loadbalancer,
+}
+
+
+# ── Absence checkers (for removal / replacement): (clients, resource_id) -> (gone, detail) ──
+
+def _absent_instance(clients, resource_id):
+    try:
+        resp = clients['ec2'].describe_instances(InstanceIds=[resource_id])
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'InvalidInstanceID.NotFound':
+            return True, "instance no longer exists"
+        raise
+    resvs = resp.get('Reservations', [])
+    if not resvs:
+        return True, "instance not found"
+    state = resvs[0]['Instances'][0]['State']['Name']
+    return state in ('terminated', 'shutting-down'), f"state={state} (expected terminated)"
+
+
+def _absent_db(clients, resource_id):
+    try:
+        clients['rds'].describe_db_instances(DBInstanceIdentifier=resource_id)
+        return False, "db instance still exists"
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'DBInstanceNotFound':
+            return True, "db instance removed"
+        raise
+
+
+def _absent_eip(clients, resource_id):
+    try:
+        resp = clients['ec2'].describe_addresses(AllocationIds=[resource_id])
+        return not resp.get('Addresses'), "eip released" if not resp.get('Addresses') else "eip still allocated"
+    except ClientError as e:
+        if e.response['Error']['Code'] in ('InvalidAllocationID.NotFound', 'InvalidAddress.NotFound'):
+            return True, "eip released"
+        raise
+
+
+def _absent_volume(clients, resource_id):
+    try:
+        clients['ec2'].describe_volumes(VolumeIds=[resource_id])
+        return False, "volume still exists"
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'InvalidVolume.NotFound':
+            return True, "volume removed"
+        raise
+
+
+ABSENCE_CHECKERS = {
+    'instance': _absent_instance,
+    'db-instance': _absent_db,
+    'eip': _absent_eip,
+    'volume': _absent_volume,
+}
+
+
+def _determine_mode(finding):
+    """Picks validation strategy from what the change actually did."""
+    edits = finding.get('TerraformEdits') or []
+    edit_types = {e.get('edit_type') for e in edits}
+    action = finding.get('Action')
+    if 'replace_resource' in edit_types:
+        return 'replace'   # original destroyed, new architecture created
+    if 'remove_resource' in edit_types or action in ('TIER_1_DELETE', 'TIER_1_RELEASE'):
+        return 'removal'   # resource should be gone
+    return 'inplace'       # same resource id survives (update_attribute / add_resource)
+
+
+def _assert_absent(clients, resource_type, resource_id):
+    checker = ABSENCE_CHECKERS.get(resource_type)
+    if not checker:
+        return True, f"removal of '{resource_type}' assumed (no absence probe available)"
+    return checker(clients, resource_id)
+
+
+# ── L2: reachability across SG/NACL/routes via VPC Reachability Analyzer ────────
+
+REACHABILITY_TIMEOUT = 150  # seconds to wait for an analysis to finish
+
+
+def _explain_block(analysis):
+    codes = [e.get('ExplanationCode') for e in analysis.get('Explanations', []) if e.get('ExplanationCode')]
+    return ', '.join(codes) if codes else "no path found"
+
+
+def _run_reachability(ec2, source, dest, port, label):
+    """Returns (found, detail). found is None when the check couldn't run (treated as a skip)."""
+    path_id = None
+    try:
+        path = ec2.create_network_insights_path(
+            Source=source, Destination=dest, Protocol='tcp', DestinationPort=port,
         )
-        
-        resource_id   = body['resource_id']
-        resource_type = body['resource_type']
-        rule_result   = body.get('rule_result', {})
-        
-        logger.info(f"Probe executing resource_id={resource_id}, resource_type={resource_type}")
-        logger.info(f"Probe rule_result payload: {rule_result}")
-        engine.ACTION_REGISTRY['TIER_1_STOP'] = lambda rid, rtype, rr, ts: _route_tier_1_stop(engine, rid, rtype, rr, ts) # type: ignore
- 
-        result = engine.execute_rule_result(resource_id, resource_type, rule_result)
-        logger.info(f"Probe result: {result}")
-        if isinstance(result, dict):
-            result.setdefault("terraform_hcl_diff", rule_result.get("terraform_hcl_diff"))
-        return result
+        path_id = path['NetworkInsightsPath']['NetworkInsightsPathId']
+        analysis = ec2.start_network_insights_analysis(NetworkInsightsPathId=path_id)
+        aid = analysis['NetworkInsightsAnalysis']['NetworkInsightsAnalysisId']
+
+        deadline = time.time() + REACHABILITY_TIMEOUT
+        while time.time() < deadline:
+            res = ec2.describe_network_insights_analyses(
+                NetworkInsightsAnalysisIds=[aid]
+            )['NetworkInsightsAnalyses'][0]
+            if res['Status'] != 'running':
+                if res.get('NetworkPathFound'):
+                    return True, f"{label}: reachable on tcp/{port}"
+                return False, f"{label}: NOT reachable on tcp/{port} (blocked by {_explain_block(res)})"
+            time.sleep(5)
+        return None, f"{label}: analysis timed out"
+    except ClientError as e:
+        code = e.response['Error']['Code']
+        if code in ('UnauthorizedOperation', 'AccessDenied', 'AccessDeniedException'):
+            return None, f"{label}: skipped (tenant role lacks Reachability Analyzer permissions)"
+        return None, f"{label}: skipped ({code})"
+    finally:
+        if path_id:
+            try:
+                ec2.delete_network_insights_path(NetworkInsightsPathId=path_id)
+            except ClientError:
+                pass
+
+
+def _find_igw(ec2, vpc_id):
+    resp = ec2.describe_internet_gateways(
+        Filters=[{'Name': 'attachment.vpc-id', 'Values': [vpc_id]}]
+    )
+    igws = resp.get('InternetGateways', [])
+    return igws[0]['InternetGatewayId'] if igws else None
+
+
+def _ingress_port(ec2, sg_ids):
+    """Best-effort: the first world-open TCP ingress port, else 443."""
+    if not sg_ids:
+        return 443
+    try:
+        sgs = ec2.describe_security_groups(GroupIds=sg_ids).get('SecurityGroups', [])
+    except ClientError:
+        return 443
+    fallback = None
+    for sg in sgs:
+        for perm in sg.get('IpPermissions', []):
+            if perm.get('IpProtocol') not in ('tcp', '6') or perm.get('FromPort') is None:
+                continue
+            if any(r.get('CidrIp') == '0.0.0.0/0' for r in perm.get('IpRanges', [])):
+                return perm['FromPort']
+            fallback = fallback or perm['FromPort']
+    return fallback or 443
+
+
+def _find_fronting_alb(elbv2, instance_id):
+    """Returns (dns, scheme) of a load balancer that has this instance as a target, else (None, None)."""
+    for lb in elbv2.describe_load_balancers().get('LoadBalancers', []):
+        tgs = elbv2.describe_target_groups(
+            LoadBalancerArn=lb['LoadBalancerArn']
+        ).get('TargetGroups', [])
+        for tg in tgs:
+            th = elbv2.describe_target_health(
+                TargetGroupArn=tg['TargetGroupArn']
+            ).get('TargetHealthDescriptions', [])
+            if any(t['Target']['Id'] == instance_id for t in th):
+                return lb.get('DNSName'), lb.get('Scheme')
+    return None, None
+
+
+def _synthetic_http(dns):
+    """L3-lite: a real request through the ingress path. Any response < 500 means it works."""
+    for scheme in ("http", "https"):
+        url = f"{scheme}://{dns}/"
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, method='GET'), timeout=10) as r:
+                return r.status < 500, f"synthetic GET {url} -> {r.status}"
+        except urllib.error.HTTPError as e:
+            return e.code < 500, f"synthetic GET {url} -> {e.code}"
+        except Exception:
+            continue
+    return False, f"synthetic GET to {dns} failed on http and https"
+
+
+def _l2_instance(clients, resource_id):
+    """Reachability + synthetic checks for an instance that should be serving traffic."""
+    ec2, elbv2 = clients['ec2'], clients['elbv2']
+    try:
+        resvs = ec2.describe_instances(InstanceIds=[resource_id]).get('Reservations', [])
+    except ClientError as e:
+        return True, f"reachability skipped (instance lookup failed: {e.response['Error']['Code']})"
+    if not resvs:
+        return True, "reachability skipped (instance not found)"
+
+    inst = resvs[0]['Instances'][0]
+    vpc_id = inst.get('VpcId')
+    public_ip = inst.get('PublicIpAddress')
+    sg_ids = [g['GroupId'] for g in inst.get('SecurityGroups', [])]
+
+    checks = []  # (ok, detail)
+
+    # Ingress from the internet, if the instance is directly addressable.
+    if public_ip and vpc_id:
+        igw = _find_igw(ec2, vpc_id)
+        if igw:
+            found, detail = _run_reachability(ec2, igw, resource_id, _ingress_port(ec2, sg_ids), "IGW->instance")
+            checks.append((True if found is None else found, detail))  # a skip is non-fatal
+
+    # Synthetic transaction through a fronting internet-facing ALB (covers private targets).
+    dns, scheme = _find_fronting_alb(elbv2, resource_id)
+    if dns and scheme == 'internet-facing':
+        ok, detail = _synthetic_http(dns)
+        checks.append((ok, f"ALB {detail}"))
+
+    if not checks:
+        return True, "no external ingress path to validate (private instance, no internet-facing ALB)"
+    return all(c[0] for c in checks), "; ".join(c[1] for c in checks)
+
+
+def _validate(clients, resource_type, resource_id, finding):
+    """Mode-aware validation so removed/replaced resources aren't judged as unhealthy."""
+    mode = _determine_mode(finding)
+
+    if mode == 'removal':
+        gone, detail = _assert_absent(clients, resource_type, resource_id)
+        return gone, f"removal: {detail}"
+
+    if mode == 'replace':
+        # The original resource was swapped out for a new topology (e.g. instance -> ASG).
+        # Confirm the old resource is gone; deep health of the new architecture is L2's job
+        # (reachability across SG/NACL/routes), not per-old-id health.
+        gone, detail = _assert_absent(clients, resource_type, resource_id)
+        note = "deep reachability validation deferred to L2"
+        return gone, f"replacement applied, original {detail}; {note}"
+
+    # In-place: resource identity survived — validate health (L1), then reachability (L2).
+    validator = VALIDATORS.get(resource_type, _validate_generic)
+    ok, detail = validator(clients, resource_id, finding)
+
+    # Reachability only matters for a resource that is meant to stay up and serving.
+    if ok and resource_type == 'instance' and finding.get('Action') != 'TIER_1_STOP':
+        l2_ok, l2_detail = _l2_instance(clients, resource_id)
+        return (ok and l2_ok), f"health[{detail}] reachability[{l2_detail}]"
+
+    return ok, detail
+
+
+def _tenant_clients(role_arn, external_id, region):
+    ak, sk, token = assume_tenant_role(role_arn, external_id, session_name="CloudOptixProbe")
+    kw = dict(region_name=region, aws_access_key_id=ak, aws_secret_access_key=sk, aws_session_token=token)
+    return {
+        'ec2': boto3.client('ec2', **kw),
+        'rds': boto3.client('rds', **kw),
+        'elbv2': boto3.client('elbv2', **kw),
+    }
+
+
+def lambda_handler(event, context):
+    tenant_id = event.get('tenant_id')
+    finding_id = event.get('finding_id')
+    resource_id = event.get('resource_id')
+
+    if not all([tenant_id, finding_id, resource_id]):
+        logger.error(f"Probe invoked without full context: {event}")
+        return {"status": "ERROR", "message": "missing tenant_id/finding_id/resource_id"}
+
+    finding = table.get_item(
+        Key={'PK': f"TENANT#{tenant_id}", 'SK': f"FINDING#{finding_id}"}
+    ).get('Item')
+    if not finding:
+        logger.warning(f"Finding {finding_id} not found; nothing to validate.")
+        return {"status": "SKIPPED"}
+
+    profile = table.get_item(Key={'PK': f"TENANT#{tenant_id}", 'SK': "PROFILE"}).get('Item', {})
+    role_arn = profile.get('TenantRoleArn')
+    region = profile.get('TargetRegion', 'ap-northeast-1')
+    external_id = profile.get('ExternalId', '')
+    resource_type = finding.get('ResourceType')
+
+    logger.info(f"Validating finding {finding_id} ({resource_type} {resource_id}) for tenant {tenant_id}")
+
+    try:
+        clients = _tenant_clients(role_arn, external_id, region)
+        ok, detail = _validate(clients, resource_type, resource_id, finding)
     except Exception as e:
-        logger.error(f"Probe Lambda crashed: {e}", exc_info=True)
-        return {"status": "ERROR", "message": str(e)}
+        logger.error(f"Validation error for {finding_id}: {e}", exc_info=True)
+        ok, detail = False, f"validation error: {e}"
+
+    status = 'VALIDATED' if ok else 'VALIDATION_FAILED'
+    logger.info(f"Finding {finding_id} -> {status} ({detail})")
+
+    _update_finding(tenant_id, finding_id, status, detail)
+    _record_history(tenant_id, finding_id, status, detail)
+    if not ok:
+        _notify(tenant_id, finding_id, detail)
+        if ROLLBACK_ENABLED:
+            _rollback(tenant_id, finding_id, resource_id, role_arn, region)
+
+    return {"status": status, "detail": detail}
+
+
+def _rollback(tenant_id, finding_id, resource_id, role_arn, region):
+    """Revert main.tf to its previous S3 version and re-apply to undo the change."""
+    config_key = f"{tenant_id}/main.tf"
+    try:
+        versions = [
+            v for v in s3.list_object_versions(Bucket=CONFIG_BUCKET, Prefix=config_key).get('Versions', [])
+            if v['Key'] == config_key
+        ]
+        # Newest-first: [0] is the just-applied (broken) version, [1] is the prior good one.
+        if len(versions) < 2:
+            logger.error(f"No previous main.tf version to roll back to for {finding_id}.")
+            _update_finding(tenant_id, finding_id, 'ROLLBACK_FAILED', 'no previous main.tf version')
+            return
+
+        prev_id = versions[1]['VersionId']
+        prev_body = s3.get_object(Bucket=CONFIG_BUCKET, Key=config_key, VersionId=prev_id)['Body'].read()
+        s3.put_object(Bucket=CONFIG_BUCKET, Key=config_key, Body=prev_body)
+        logger.info(f"Reverted main.tf to version {prev_id}; triggering rollback apply for {finding_id}.")
+
+        build = codebuild.start_build(
+            projectName=CODEBUILD_PROJECT,
+            environmentVariablesOverride=[
+                {'name': 'TENANT_ID', 'value': tenant_id, 'type': 'PLAINTEXT'},
+                {'name': 'ACTION_ID', 'value': finding_id, 'type': 'PLAINTEXT'},
+                {'name': 'CONFIG_BUCKET', 'value': CONFIG_BUCKET, 'type': 'PLAINTEXT'},
+                {'name': 'STATE_BUCKET', 'value': STATE_BUCKET, 'type': 'PLAINTEXT'},
+                {'name': 'TENANT_ROLE_ARN', 'value': role_arn or '', 'type': 'PLAINTEXT'},
+                {'name': 'RESOURCE_ID', 'value': resource_id, 'type': 'PLAINTEXT'},
+                {'name': 'AWS_REGION', 'value': region, 'type': 'PLAINTEXT'},
+                {'name': 'APPLY', 'value': 'true', 'type': 'PLAINTEXT'},
+                {'name': 'ROLLBACK', 'value': 'true', 'type': 'PLAINTEXT'},  # build_monitor won't re-validate
+            ],
+        )
+        table.update_item(
+            Key={'PK': f"TENANT#{tenant_id}", 'SK': f"FINDING#{finding_id}"},
+            UpdateExpression="SET #s = :s, CodeBuildRollbackId = :b, UpdatedAt = :ts",
+            ConditionExpression="attribute_exists(SK)",
+            ExpressionAttributeNames={'#s': 'Status'},
+            ExpressionAttributeValues={
+                ':s': 'ROLLING_BACK',
+                ':b': build.get('build', {}).get('id', ''),
+                ':ts': datetime.now(timezone.utc).isoformat(),
+            },
+        )
+    except ClientError as e:
+        logger.error(f"Rollback failed for {finding_id}: {e}", exc_info=True)
+        _update_finding(tenant_id, finding_id, 'ROLLBACK_FAILED', f"rollback error: {e}")
+
+
+def _update_finding(tenant_id, finding_id, status, detail):
+    try:
+        table.update_item(
+            Key={'PK': f"TENANT#{tenant_id}", 'SK': f"FINDING#{finding_id}"},
+            UpdateExpression="SET #s = :s, ValidationDetail = :d, ValidatedAt = :ts",
+            ConditionExpression="attribute_exists(SK)",
+            ExpressionAttributeNames={'#s': 'Status'},
+            ExpressionAttributeValues={
+                ':s': status,
+                ':d': detail,
+                ':ts': datetime.now(timezone.utc).isoformat(),
+            },
+        )
+    except ClientError as e:
+        if e.response['Error']['Code'] != 'ConditionalCheckFailedException':
+            raise
+
+
+def _record_history(tenant_id, finding_id, status, detail):
+    now = datetime.now(timezone.utc).isoformat()
+    table.put_item(Item={
+        'PK': f"TENANT#{tenant_id}",
+        'SK': f"EXEC#{now}#{finding_id}-validation",
+        'Type': 'ExecutionRecord',
+        'FindingId': finding_id,
+        'Phase': 'validate',
+        'Result': status,
+        'Detail': detail,
+        'CreatedAt': now,
+    })
+
+
+def _notify(tenant_id, finding_id, detail):
+    if not SNS_TOPIC_ARN:
+        return
+    try:
+        sns.publish(
+            TopicArn=SNS_TOPIC_ARN,
+            Subject="CloudOptix: post-apply validation FAILED",
+            Message=(f"Tenant {tenant_id} finding {finding_id} failed post-apply validation: {detail}. "
+                     f"The applied change may have degraded the resource — review and consider rolling back."),
+        )
+    except ClientError as e:
+        logger.warning(f"SNS publish failed: {e}")

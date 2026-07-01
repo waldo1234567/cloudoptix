@@ -42,16 +42,26 @@ resource "aws_iam_role_policy" "worker_lambda_permissions" {
         Resource = aws_sns_topic.alerts.arn
       },
       {
-        Action   = "codebuild:StartBuild"
+        Action   = ["codebuild:StartBuild", "codebuild:BatchGetBuilds"]
         Effect   = "Allow"
         Resource = aws_codebuild_project.terraform_runner.arn
       },
       {
-        Action = ["s3:GetObject", "s3:PutObject"]
+        Action   = "lambda:InvokeFunction"
+        Effect   = "Allow"
+        Resource = aws_lambda_function.probe_executor.arn
+      },
+      {
+        Action = ["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject"]
         Effect = "Allow"
         Resource = [
           "${aws_s3_bucket.tenant_configs.arn}/*"
         ]
+      },
+      {
+        Action   = ["s3:ListBucketVersions"]
+        Effect   = "Allow"
+        Resource = aws_s3_bucket.tenant_configs.arn
       },
       {
         Action   = ["s3:GetObject"]
@@ -167,8 +177,11 @@ resource "aws_lambda_function" "probe_executor" {
 
   environment {
     variables = {
-      DYNAMODB_TABLE_NAME = aws_dynamodb_table.cloudoptix_table.name
-      SNS_TOPIC_ARN       = aws_sns_topic.alerts.arn
+      DYNAMODB_TABLE_NAME    = aws_dynamodb_table.cloudoptix_table.name
+      SNS_TOPIC_ARN          = aws_sns_topic.alerts.arn
+      CONFIG_BUCKET          = aws_s3_bucket.tenant_configs.bucket
+      STATE_BUCKET           = aws_s3_bucket.tenant_tfstate.bucket
+      CODEBUILD_PROJECT_NAME = aws_codebuild_project.terraform_runner.name
     }
   }
 }
@@ -263,6 +276,52 @@ resource "aws_lambda_event_source_mapping" "action_queue_trigger" {
   batch_size       = 1
 
   depends_on = [aws_iam_role_policy_attachment.action_sqs_trigger]
+}
+
+resource "aws_lambda_function" "build_monitor" {
+  filename         = data.archive_file.backend_zip.output_path
+  source_code_hash = data.archive_file.backend_zip.output_base64sha256
+  function_name    = "CloudOptix-Build-Monitor"
+  role             = aws_iam_role.worker_lambda_role.arn
+  handler          = "lambdas.build_monitor.handler.lambda_handler"
+  runtime          = "python3.11"
+  timeout          = 60
+
+  environment {
+    variables = {
+      DYNAMODB_TABLE_NAME = aws_dynamodb_table.cloudoptix_table.name
+      SNS_TOPIC_ARN       = aws_sns_topic.alerts.arn
+      PROBE_FUNCTION_NAME = aws_lambda_function.probe_executor.function_name
+    }
+  }
+}
+
+resource "aws_cloudwatch_event_rule" "codebuild_complete" {
+  name        = "CloudOptix-CodeBuild-Complete"
+  description = "Fires the build monitor when a Terraform runner build reaches a terminal state"
+
+  event_pattern = jsonencode({
+    source        = ["aws.codebuild"]
+    "detail-type" = ["CodeBuild Build State Change"]
+    detail = {
+      "build-status" = ["SUCCEEDED", "FAILED", "FAULT", "STOPPED", "TIMED_OUT"]
+      "project-name" = [aws_codebuild_project.terraform_runner.name]
+    }
+  })
+}
+
+resource "aws_cloudwatch_event_target" "trigger_build_monitor" {
+  rule      = aws_cloudwatch_event_rule.codebuild_complete.name
+  target_id = "TriggerBuildMonitor"
+  arn       = aws_lambda_function.build_monitor.arn
+}
+
+resource "aws_lambda_permission" "allow_eventbridge_build_monitor" {
+  statement_id  = "AllowEventBridgeInvokeBuildMonitor"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.build_monitor.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.codebuild_complete.arn
 }
 
 resource "aws_cloudwatch_event_rule" "daily_orchestration" {

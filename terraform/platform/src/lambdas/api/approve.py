@@ -65,6 +65,7 @@ def lambda_handler(event, context):
                 {'name': 'TENANT_ROLE_ARN', 'value': tenant_role_arn, 'type': 'PLAINTEXT'},
                 {'name': 'RESOURCE_ID', 'value': resource_id, 'type': 'PLAINTEXT'},
                 {'name': 'AWS_REGION', 'value': region, 'type': 'PLAINTEXT'},
+                {'name': 'APPLY', 'value': 'true', 'type': 'PLAINTEXT'},
             ],
         )
 

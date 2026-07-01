@@ -122,12 +122,14 @@ def lambda_handler(event, context):
                 ],
             )
 
+            # Intermediate state: the build_monitor promotes this to PENDING_APPROVAL
+            # only if the plan build actually succeeds (else PLAN_FAILED).
             _update_finding_status(
-                tenant_id, finding_id, 'PENDING_APPROVAL',
+                tenant_id, finding_id, 'PLANNING',
                 build_id=build.get('build', {}).get('id', ''),
                 skipped=skipped,
             )
-            logger.info(f"Staged plan for finding {finding_id}.")
+            logger.info(f"Staged plan for finding {finding_id} (awaiting plan result).")
 
         except Exception as e:
             logger.error(f"HCL Writer error on record: {e}", exc_info=True)
