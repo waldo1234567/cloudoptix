@@ -41,10 +41,12 @@ CORE_TABLE_DEFAULT        = "cloudoptix-core-table"
 CODEBUILD_PROJECT_DEFAULT = "CloudOptix-Terraform-Runner"
 ACTION_QUEUE_NAME_DEFAULT = "cloudoptix-action-queue.fifo"
 APPROVE_LAMBDA_DEFAULT    = "CloudOptix-API-Approve"
+TENANT_MGMT_LAMBDA_DEFAULT = "CloudOptix-Tenant-Mgmt"
+TF_UPLOAD_LAMBDA_DEFAULT   = "CloudOptix-TF-Upload"
 CONFIG_BUCKET_FMT         = "cloudoptix-tenant-configs-{account}"
 STATE_BUCKET_FMT          = "cloudoptix-tenant-tfstate-{account}"
 
-BUILD_TIMEOUT = 900   # seconds to wait for a CodeBuild run (instance apply/destroy is slower)
+BUILD_TIMEOUT = 1800  # seconds to wait for a CodeBuild run (RDS create/destroy is very slow)
 POLL_TIMEOUT  = 300   # seconds to wait for an async DynamoDB write (writer / parser / probe)
 POLL_INTERVAL = 10
 
@@ -74,6 +76,8 @@ class Harness:
         self.core_table = args.core_table
         self.codebuild_project = args.codebuild_project
         self.approve_lambda = args.approve_lambda
+        self.tenant_mgmt_lambda = args.tenant_mgmt_lambda
+        self.tf_upload_lambda = args.tf_upload_lambda
         self.config_bucket = args.config_bucket or CONFIG_BUCKET_FMT.format(account=self.account)
         self.state_bucket = args.state_bucket or STATE_BUCKET_FMT.format(account=self.account)
         self.config_key = f"{self.tenant_id}/main.tf"
@@ -84,8 +88,25 @@ class Harness:
         self.cb = self.session.client("codebuild")
         self.lam = self.session.client("lambda")
 
-        # Resource lives in the TENANT account; verify/cleanup must talk to it.
-        self.tenant_session = self._tenant_session(args)
+        
+        if self.scenario == "path-b" and args.tenant_id:
+            prof = self.table.get_item(
+                Key={"PK": f"TENANT#{self.tenant_id}", "SK": "PROFILE"}).get("Item") or {}
+            self.tenant_role_arn = prof.get("TenantRoleArn", self.tenant_role_arn)
+            if args.external_id:
+                self.external_id = args.external_id
+                self.table.update_item(
+                    Key={"PK": f"TENANT#{self.tenant_id}", "SK": "PROFILE"},
+                    UpdateExpression="SET ExternalId = :e",
+                    ExpressionAttributeValues={":e": args.external_id})
+                log("init", "using caller --external-id (synced into profile) for the tenant trust")
+            else:
+                self.external_id = prof.get("ExternalId", self.external_id)
+
+        # The tenant session (verify/cleanup) is built lazily on first use — the register
+        # stage never needs it, and the role can't be assumed until the CFN trust exists.
+        self.tenant_profile = args.tenant_profile
+        self._tenant_session_obj = None
         self.action_queue_url = self.sqs.get_queue_url(QueueName=args.action_queue_name)["QueueUrl"]
 
         # Scenario-specific shape.
@@ -98,6 +119,14 @@ class Harness:
             self.resource_type = "parameter"
             self.edit_attr = "value"
             self.before, self.after = "before", "after"
+        elif self.scenario == "path-b":
+            # The tenant's "own" SSM parameter + resource label (as if from their TF).
+            self.param_name = f"/cloudoptix/e2e/{self.tenant_id}"
+            self.resource_id = self.param_name
+            self.tf_address = "aws_ssm_parameter.user_param"
+            self.resource_type = "parameter"
+            self.edit_attr = "value"
+            self.before, self.after = "before", "after"
         else:  # instance or instance-break (same bootstrap infra)
             self.tf_address = "aws_instance.cloudoptix_e2e"
             self.resource_type = "instance"
@@ -107,10 +136,16 @@ class Harness:
         log("init", f"account={self.account} region={self.region} tenant={self.tenant_id} scenario={self.scenario}")
         log("init", f"config_bucket={self.config_bucket} state_bucket={self.state_bucket}")
 
-    def _tenant_session(self, args):
-        if args.tenant_profile:
-            log("init", f"tenant account via profile '{args.tenant_profile}'")
-            return boto3.Session(profile_name=args.tenant_profile, region_name=self.region)
+    @property
+    def tenant_session(self):
+        if self._tenant_session_obj is None:
+            self._tenant_session_obj = self._build_tenant_session()
+        return self._tenant_session_obj
+
+    def _build_tenant_session(self):
+        if self.tenant_profile:
+            log("init", f"tenant account via profile '{self.tenant_profile}'")
+            return boto3.Session(profile_name=self.tenant_profile, region_name=self.region)
         log("init", "tenant account via assume-role on the platform session")
         params = {"RoleArn": self.tenant_role_arn, "RoleSessionName": "cloudoptix-e2e-verify"}
         if self.external_id:
@@ -123,7 +158,7 @@ class Harness:
             region_name=self.region,
         )
 
-    # -- workspace --------------------------------------------------------------
+    
     def _providers_tf(self):
         ext = f'    external_id = "{self.external_id}"\n' if self.external_id else ''
         return (
@@ -147,7 +182,7 @@ class Harness:
                 '}\n'
             )
         # instance scenario: a minimal internet-facing instance so L2 IGW->instance applies.
-        return f'''data "aws_ami" "al2" {{
+        tf = f'''data "aws_ami" "al2" {{
   most_recent = true
   owners      = ["amazon"]
   filter {{
@@ -210,6 +245,72 @@ resource "aws_instance" "cloudoptix_e2e" {{
   tags = {{ Name = "cloudoptix-e2e" }}
 }}
 '''
+        if self.negative:
+            # A second SG with NO ingress; the break finding swaps the instance onto this
+            # so L2 (IGW->instance) finds it unreachable and the change auto-rolls-back.
+            tf += (
+                '\nresource "aws_security_group" "cloudoptix_e2e_deny" {\n'
+                '  name_prefix = "cloudoptix-e2e-deny-"\n'
+                '  vpc_id      = aws_vpc.cloudoptix_e2e.id\n'
+                '  egress {\n'
+                '    from_port   = 0\n'
+                '    to_port     = 0\n'
+                '    protocol    = "-1"\n'
+                '    cidr_blocks = ["0.0.0.0/0"]\n'
+                '  }\n'
+                '}\n'
+            )
+        elif self.scenario == "instance-rds":
+            # A private RDS whose SG allows inbound from the app instance's SG. The probe should
+            # infer this dependency and prove instance -> RDS-ENI:5432 reachability.
+            tf += (
+                '\ndata "aws_availability_zones" "azs" {\n'
+                '  state = "available"\n'
+                '}\n\n'
+                'resource "aws_subnet" "cloudoptix_e2e_db1" {\n'
+                '  vpc_id            = aws_vpc.cloudoptix_e2e.id\n'
+                '  cidr_block        = "10.0.2.0/24"\n'
+                '  availability_zone = data.aws_availability_zones.azs.names[0]\n'
+                '}\n\n'
+                'resource "aws_subnet" "cloudoptix_e2e_db2" {\n'
+                '  vpc_id            = aws_vpc.cloudoptix_e2e.id\n'
+                '  cidr_block        = "10.0.3.0/24"\n'
+                '  availability_zone = data.aws_availability_zones.azs.names[1]\n'
+                '}\n\n'
+                'resource "aws_db_subnet_group" "cloudoptix_e2e" {\n'
+                '  name_prefix = "cloudoptix-e2e-"\n'
+                '  subnet_ids  = [aws_subnet.cloudoptix_e2e_db1.id, aws_subnet.cloudoptix_e2e_db2.id]\n'
+                '}\n\n'
+                'resource "aws_security_group" "cloudoptix_e2e_db" {\n'
+                '  name_prefix = "cloudoptix-e2e-db-"\n'
+                '  vpc_id      = aws_vpc.cloudoptix_e2e.id\n'
+                '  ingress {\n'
+                '    from_port       = 5432\n'
+                '    to_port         = 5432\n'
+                '    protocol        = "tcp"\n'
+                '    security_groups = [aws_security_group.cloudoptix_e2e.id]\n'
+                '  }\n'
+                '  egress {\n'
+                '    from_port   = 0\n'
+                '    to_port     = 0\n'
+                '    protocol    = "-1"\n'
+                '    cidr_blocks = ["0.0.0.0/0"]\n'
+                '  }\n'
+                '}\n\n'
+                'resource "aws_db_instance" "cloudoptix_e2e" {\n'
+                '  identifier_prefix      = "cloudoptix-e2e-"\n'
+                '  engine                 = "postgres"\n'
+                '  instance_class         = "db.t3.micro"\n'
+                '  allocated_storage      = 20\n'
+                '  username               = "cloudoptix"\n'
+                '  password               = "Cloudoptix-E2E-Pw-123"\n'
+                '  db_subnet_group_name   = aws_db_subnet_group.cloudoptix_e2e.name\n'
+                '  vpc_security_group_ids = [aws_security_group.cloudoptix_e2e_db.id]\n'
+                '  publicly_accessible    = false\n'
+                '  skip_final_snapshot    = true\n'
+                '}\n'
+            )
+        return tf
 
     def _put(self, bucket, key, body):
         self.s3.put_object(Bucket=bucket, Key=key, Body=body.encode("utf-8"))
@@ -300,7 +401,7 @@ resource "aws_instance" "cloudoptix_e2e" {{
 
     # -- verification -----------------------------------------------------------
     def verify_resource(self, expected):
-        if self.scenario == "param":
+        if self.scenario in ("param", "path-b"):
             val = self.tenant_session.client("ssm").get_parameter(Name=self.resource_id)["Parameter"]["Value"]
             what = f"SSM {self.resource_id} value"
         else:
@@ -313,32 +414,19 @@ resource "aws_instance" "cloudoptix_e2e" {{
             fail(f"{what} '{val}' != expected '{expected}'")
 
     # -- findings / queue -------------------------------------------------------
-    _BROKEN_SG_HCL = (
-        'resource "aws_security_group" "cloudoptix_e2e" {\n'
-        '  name_prefix = "cloudoptix-e2e-"\n'
-        '  vpc_id      = aws_vpc.cloudoptix_e2e.id\n'
-        '  # reachability-break: ingress intentionally removed\n'
-        '  egress {\n'
-        '    from_port   = 0\n'
-        '    to_port     = 0\n'
-        '    protocol    = "-1"\n'
-        '    cidr_blocks = ["0.0.0.0/0"]\n'
-        '  }\n'
-        '}'
-    )
-
     def seed_finding(self):
         finding_id = f"f-e2e-{uuid.uuid4().hex[:8]}"
         if self.negative:
-            # Finding is "about" the instance (probe validates its reachability), but the edit
-            # rewrites the SG to drop the ingress rule — breaking the path on purpose.
+            # In-place edit on the instance itself (so mode=inplace and the probe runs L2 on it):
+            # swap its security group to the no-ingress "deny" SG, breaking reachability.
             edits = [{
-                "edit_type": "replace_resource",
-                "resource_address": "aws_security_group.cloudoptix_e2e",
-                "attribute_path": None, "old_value": None, "new_value": None,
-                "full_resource_hcl": self._BROKEN_SG_HCL,
+                "edit_type": "update_attribute", "resource_address": "__TF_ADDRESS__",
+                "attribute_path": "vpc_security_group_ids",
+                "old_value": "[aws_security_group.cloudoptix_e2e.id]",
+                "new_value": "[aws_security_group.cloudoptix_e2e_deny.id]",
+                "full_resource_hcl": None,
             }]
-            reasoning = "E2E negative: remove SG ingress (breaks reachability)."
+            reasoning = "E2E negative: swap instance onto a no-ingress SG (breaks reachability)."
         else:
             edits = [{
                 "edit_type": "update_attribute", "resource_address": "__TF_ADDRESS__",
@@ -382,6 +470,8 @@ resource "aws_instance" "cloudoptix_e2e" {{
 
     # -- stages -----------------------------------------------------------------
     def bootstrap(self):
+        if self.scenario == "path-b":
+            return self._pathb_onboard()
         log("BOOTSTRAP", f"creating real {self.scenario} + state via CodeBuild apply")
         self.seed_profile()
         self.seed_workspace()
@@ -390,6 +480,99 @@ resource "aws_instance" "cloudoptix_e2e" {{
         self.resource_id = self.await_state_mapping()
         self.verify_resource(self.before)
         log("BOOTSTRAP", "✅ resource created, tfstate parsed, STATEADDR# present")
+
+    # -- Path B (register endpoint + tf_upload of existing files/state) ----------
+    def pathb_register(self):
+        if self.scenario != "path-b":
+            fail("--stage register is only valid for --scenario path-b")
+        tenant_acct = self.tenant_role_arn.split(":")[4]
+        event = {
+            "routeKey": "POST /api/v1/tenants/register",
+            "rawPath": "/api/v1/tenants/register",
+            "requestContext": {"http": {"method": "POST"},
+                               "authorizer": {"jwt": {"claims": {"sub": "e2e-tester"}}}},
+            "body": json.dumps({"account_id": tenant_acct, "region": self.region,
+                                "has_terraform": True, "tenant_name": "e2e-path-b"}),
+        }
+        resp = self.lam.invoke(FunctionName=self.tenant_mgmt_lambda, Payload=json.dumps(event).encode("utf-8"))
+        payload = json.loads(resp["Payload"].read())
+        if payload.get("statusCode") != 201:
+            fail(f"register returned {payload.get('statusCode')}: {payload.get('body')}")
+        body = json.loads(payload["body"])
+        if body.get("onboarding_path") != "B":
+            fail(f"expected onboarding_path B, got {body.get('onboarding_path')}")
+        role = body["cross_account_role"]
+        tid = body["tenant_id"]
+        print("\n" + "=" * 72)
+        print(f"✅ Registered Path B tenant: {tid}")
+        print(f"   role_arn    = {role['role_arn']}")
+        print(f"   external_id = {role['external_id']}")
+        print(f"   trusts      = {role['trusted_principal']}")
+        print("\nNEXT: deploy/update the tenant CFN so that role trusts the platform principal")
+        print(f"      with ExternalId = {role['external_id']}, then run:\n")
+        print(f"  python e2e_pipeline_test.py --scenario path-b --tenant-id {tid} \\")
+        print(f"    --tenant-role-arn {role['role_arn']} --stage all")
+        print("=" * 72 + "\n")
+
+    def _user_main_tf(self):
+        return (
+            'resource "aws_ssm_parameter" "user_param" {\n'
+            f'  name  = "{self.param_name}"\n'
+            '  type  = "String"\n'
+            f'  value = "{self.before}"\n'
+            '}\n'
+        )
+
+    def _pathb_onboard(self):
+        if not self.external_id:
+            fail("no ExternalId on the tenant profile — run '--stage register' first, then deploy the CFN.")
+        log("PATH-B", f"onboarding tenant {self.tenant_id} using the registered external_id")
+
+        # 1) Simulate the tenant's PRIOR terraform apply -> a real resource + a REAL tfstate.
+        self._put(self.config_bucket, f"{self.tenant_id}/providers.tf", self._providers_tf())
+        self._put(self.config_bucket, self.config_key, self._user_main_tf())
+        self.wait_build(self.start_build(apply=True, action_id="user-apply", resource_id=self.resource_id),
+                        "user-prior-apply")
+        self.verify_resource(self.before)
+        real_state = self.s3.get_object(
+            Bucket=self.state_bucket, Key=f"{self.tenant_id}/terraform.tfstate")["Body"].read().decode("utf-8")
+        log("PATH-B", "captured the tenant's real tfstate")
+
+        # 2) Re-onboard via the real tf_upload endpoint: user main.tf + a BARE provider + their state.
+        event = {
+            "routeKey": "POST /api/v1/tenants/{id}/tf/upload",
+            "rawPath": f"/api/v1/tenants/{self.tenant_id}/tf/upload",
+            "pathParameters": {"id": self.tenant_id},
+            "requestContext": {"http": {"method": "POST"},
+                               "authorizer": {"jwt": {"claims": {"sub": "e2e-tester"}}}},
+            "body": json.dumps({
+                "files": [
+                    {"path": "main.tf", "content": self._user_main_tf()},
+                    {"path": "providers.tf", "content": f'provider "aws" {{\n  region = "{self.region}"\n}}\n'},
+                ],
+                "tfstate": real_state,
+            }),
+        }
+        resp = self.lam.invoke(FunctionName=self.tf_upload_lambda, Payload=json.dumps(event).encode("utf-8"))
+        payload = json.loads(resp["Payload"].read())
+        log("PATH-B", f"tf_upload -> {payload.get('statusCode')}: {payload.get('body')}")
+        if payload.get("statusCode") != 200:
+            fail(f"tf_upload returned {payload.get('statusCode')}: {payload.get('body')}")
+
+        # 3) Assert tf_upload injected the CloudOptix backend + an assume_role provider.
+        providers = self.s3.get_object(
+            Bucket=self.config_bucket, Key=f"{self.tenant_id}/providers.tf")["Body"].read().decode("utf-8")
+        if "assume_role" not in providers:
+            fail(f"tf_upload did not inject assume_role into providers.tf:\n{providers}")
+        try:
+            self.s3.get_object(Bucket=self.config_bucket, Key=f"{self.tenant_id}/backend.tf")
+        except ClientError:
+            fail("tf_upload did not write backend.tf")
+        log("PATH-B", "✅ tf_upload stored files, injected assume_role + backend.tf")
+
+        # 4) The uploaded tfstate should drive the state parser -> STATEADDR#.
+        self.resource_id = self.await_state_mapping()
+        log("PATH-B", "✅ uploaded state parsed -> STATEADDR#; workspace is CloudOptix-managed")
 
     def edit_flow(self):
         if self.resource_id is None:
@@ -427,13 +610,16 @@ resource "aws_instance" "cloudoptix_e2e" {{
         self.verify_resource(self.after)
 
         item = self.wait_finding_status(finding_id, "VALIDATED")
-        log("PROBE", f"post-apply validation detail: {item.get('ValidationDetail')}")
+        detail = item.get("ValidationDetail", "")
+        log("PROBE", f"post-apply validation detail: {detail}")
+        if self.scenario == "instance-rds" and not re.search(r"instance->\S+: reachable", detail):
+            fail(f"expected EC2->RDS reachability proof in validation detail; got: {detail!r}")
         log("APPROVE", f"✅ applied {self.before} -> {self.after}; finding VALIDATED")
         return finding_id
 
     def _edit_flow_break(self):
-        sg_id = self.await_state_mapping("aws_security_group.cloudoptix_e2e")
-        log("BREAK", "seeding a finding that removes the SG ingress (expect L2 fail + auto-rollback)")
+        log("BREAK", "seeding a finding that swaps the instance onto a no-ingress SG "
+                     "(expect L2 fail + auto-rollback)")
         finding_id = self.seed_finding()
         self.send_action(finding_id)
         item = self.wait_finding_status(finding_id, "PENDING_APPROVAL")
@@ -452,24 +638,27 @@ resource "aws_instance" "cloudoptix_e2e" {{
         log("PROBE", f"validation detail: {detail}")
         if "NOT reachable" not in detail:
             fail(f"expected L2 to report NOT reachable before rollback; got: {detail!r}")
-        self._assert_sg_ingress_restored(sg_id)
-        log("ROLLBACK", "✅ L2 caught the break, finding ROLLED_BACK, SG ingress restored")
+        self._assert_instance_reachable_sg()
+        log("ROLLBACK", "✅ L2 caught the break, finding ROLLED_BACK, instance SG restored")
         return finding_id
 
-    def _assert_sg_ingress_restored(self, sg_id):
-        sg = self.tenant_session.client("ec2").describe_security_groups(
-            GroupIds=[sg_id])["SecurityGroups"][0]
+    def _assert_instance_reachable_sg(self):
+        """After rollback the instance should be back on a SG that allows port-80 ingress."""
+        ec2 = self.tenant_session.client("ec2")
+        inst = ec2.describe_instances(InstanceIds=[self.resource_id])["Reservations"][0]["Instances"][0]
+        sg_ids = [g["GroupId"] for g in inst.get("SecurityGroups", [])]
+        sgs = ec2.describe_security_groups(GroupIds=sg_ids)["SecurityGroups"] if sg_ids else []
         has80 = any(
             p.get("FromPort") == 80 and any(r.get("CidrIp") == "0.0.0.0/0" for r in p.get("IpRanges", []))
-            for p in sg.get("IpPermissions", [])
+            for sg in sgs for p in sg.get("IpPermissions", [])
         )
-        log("verify", f"SG {sg_id} port-80 ingress restored = {has80}")
+        log("verify", f"instance {self.resource_id} SGs={sg_ids} port-80 ingress restored = {has80}")
         if not has80:
-            fail("rollback did not restore the SG port-80 ingress")
+            fail("rollback did not restore the instance's port-80 ingress SG")
 
     def cleanup(self):
         log("CLEANUP", "removing test resources and seeded data")
-        if self.scenario in ("instance", "instance-break"):
+        if self.scenario in ("instance", "instance-break", "instance-rds"):
             # Tear down the real VPC/instance/etc. with a destroy apply (empty config).
             self._put(self.config_bucket, self.config_key,
                       "# CloudOptix E2E teardown — all managed resources removed.\n")
@@ -479,7 +668,7 @@ resource "aws_instance" "cloudoptix_e2e" {{
             except SystemExit:
                 log("cleanup", "⚠️  destroy apply FAILED — check the CodeBuild logs and remove the "
                                f"cloudoptix-e2e VPC/instance in the tenant account manually (tenant {self.tenant_id}).")
-        elif self.scenario == "param" and self.resource_id:
+        elif self.scenario in ("param", "path-b") and self.resource_id:
             try:
                 self.tenant_session.client("ssm").delete_parameter(Name=self.resource_id)
                 log("cleanup", f"deleted SSM parameter {self.resource_id}")
@@ -514,9 +703,15 @@ def main():
     p = argparse.ArgumentParser(description="CloudOptix end-to-end pipeline test")
     p.add_argument("--tenant-role-arn", required=True,
                    help="Tenant deployment role ARN assumed by the provider / probe")
-    p.add_argument("--scenario", choices=["param", "instance", "instance-break"], default="param",
+    p.add_argument("--scenario", choices=["param", "instance", "instance-break", "instance-rds", "path-b"],
+                   default="param",
                    help="param: SSM value flip (fast). instance: real EC2 downsize exercising L2 reachability. "
-                        "instance-break: remove the SG ingress so L2 fails and the change auto-rolls-back.")
+                        "instance-break: remove the SG ingress so L2 fails and the change auto-rolls-back. "
+                        "instance-rds: EC2 + private RDS; assert L2 proves EC2->RDS reachability (SLOW ~30-40 min). "
+                        "path-b: register via the API, then upload existing TF + state via tf_upload and manage it. "
+                        "Run --stage register first, deploy the CFN with the printed external_id, then --stage all.")
+    p.add_argument("--tenant-mgmt-lambda", default=TENANT_MGMT_LAMBDA_DEFAULT)
+    p.add_argument("--tf-upload-lambda", default=TF_UPLOAD_LAMBDA_DEFAULT)
     p.add_argument("--external-id", default=None,
                    help="External ID required by the tenant role's trust policy (omit if none)")
     p.add_argument("--tenant-profile", default=None,
@@ -529,11 +724,14 @@ def main():
     p.add_argument("--action-queue-name", default=ACTION_QUEUE_NAME_DEFAULT)
     p.add_argument("--codebuild-project", default=CODEBUILD_PROJECT_DEFAULT)
     p.add_argument("--approve-lambda", default=APPROVE_LAMBDA_DEFAULT)
-    p.add_argument("--stage", choices=["all", "bootstrap", "edit", "cleanup"], default="all")
+    p.add_argument("--stage", choices=["all", "register", "bootstrap", "edit", "cleanup"], default="all")
     p.add_argument("--keep", action="store_true", help="Skip cleanup at the end")
     args = p.parse_args()
 
     h = Harness(args)
+    if args.stage == "register":
+        h.pathb_register()
+        return
     try:
         if args.stage in ("all", "bootstrap"):
             h.bootstrap()

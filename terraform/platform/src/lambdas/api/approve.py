@@ -53,6 +53,11 @@ def lambda_handler(event, context):
         if not tenant_role_arn:
             return _response(409, {"error": "Tenant profile is missing TenantRoleArn; cannot assume execution role."})
 
+        # Hard gate: never plan/apply without terraform state, or terraform would try
+        # to create resources that already exist.
+        if not profile.get('WorkspaceReady'):
+            return _response(409, {"error": "Workspace not ready — upload your Terraform state before applying changes."})
+
         resource_id = finding.get('ResourceId', '')
 
         build = codebuild.start_build(

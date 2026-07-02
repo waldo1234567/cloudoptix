@@ -20,7 +20,10 @@ def discover(tenant_id: str, account_id: str, region: str, role_arn: str, extern
     
     for page in paginator.paginate():
         for nat in page.get('NatGateways', []):
-            
+            # Deleted NAT gateways linger in describe_nat_gateways (~1h). Skip them.
+            if nat.get('State') in ('deleted', 'deleting', 'failed'):
+                continue
+
             nat_id = nat['NatGatewayId']
             arn = f"arn:aws:ec2:{region}:{account_id}:natgateway/{nat_id}"
             

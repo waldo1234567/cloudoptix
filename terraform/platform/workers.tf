@@ -13,7 +13,7 @@ resource "aws_iam_role_policy" "worker_lambda_permissions" {
     Version = "2012-10-17"
     Statement = [
       {
-        Action = ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:Query", "dynamodb:Scan", "dynamodb:BatchWriteItem"]
+        Action = ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:Query", "dynamodb:Scan", "dynamodb:BatchWriteItem"]
         Effect = "Allow"
         Resource = [
           aws_dynamodb_table.cloudoptix_table.arn,
@@ -261,7 +261,7 @@ resource "aws_lambda_event_source_mapping" "metrics_trigger" {
 
 resource "aws_lambda_event_source_mapping" "rules_trigger" {
   event_source_arn = aws_sqs_queue.rules_queue.arn
-  function_name    = aws_lambda_function.rules_engine.arn 
+  function_name    = aws_lambda_function.rules_engine.arn
   batch_size       = 1
 }
 
@@ -292,6 +292,7 @@ resource "aws_lambda_function" "build_monitor" {
       DYNAMODB_TABLE_NAME = aws_dynamodb_table.cloudoptix_table.name
       SNS_TOPIC_ARN       = aws_sns_topic.alerts.arn
       PROBE_FUNCTION_NAME = aws_lambda_function.probe_executor.function_name
+      SCAN_QUEUE_URL      = aws_sqs_queue.scan_queue.url
     }
   }
 }

@@ -29,10 +29,12 @@ dynamodb = boto3.resource('dynamodb')
 codebuild = boto3.client('codebuild')
 sns = boto3.client('sns')
 lam = boto3.client('lambda')
+sqs = boto3.client('sqs')
 
 TABLE_NAME = os.environ.get('DYNAMODB_TABLE_NAME', 'cloudoptix-core-table')
 SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN')
 PROBE_FUNCTION_NAME = os.environ.get('PROBE_FUNCTION_NAME')
+SCAN_QUEUE_URL = os.environ.get('SCAN_QUEUE_URL')
 table = dynamodb.Table(TABLE_NAME)  # type: ignore
 
 SUCCESS = "SUCCEEDED"
@@ -78,6 +80,12 @@ def lambda_handler(event, context):
 
     logger.info(f"Build {build_id} phase={phase} status={status} tenant={tenant_id} finding={finding_id}")
 
+    # A reconcile (refresh-only) build has a tenant but no finding: the state was
+    # synced to reality -> kick a scan so RESOURCE# catches up.
+    if env.get('REFRESH_ONLY') == 'true':
+        _handle_reconcile(tenant_id, succeeded)
+        return {"statusCode": 200}
+
     if not tenant_id or not finding_id:
         logger.info("Build has no tenant/finding context (e.g. bootstrap). Nothing to reconcile.")
         return {"statusCode": 200}
@@ -102,6 +110,32 @@ def lambda_handler(event, context):
         _trigger_validation(tenant_id, finding_id, resource_id)
 
     return {"statusCode": 200, "finding_status": new_status}
+
+
+def _handle_reconcile(tenant_id, succeeded):
+    if not tenant_id:
+        return
+    status = 'DONE' if succeeded else 'FAILED'
+    try:
+        table.update_item(
+            Key={'PK': f"TENANT#{tenant_id}", 'SK': "PROFILE"},
+            UpdateExpression="SET ReconcileStatus = :s, LastReconcileAt = :t",
+            ExpressionAttributeValues={':s': status, ':t': datetime.now(timezone.utc).isoformat()},
+        )
+    except ClientError as e:
+        logger.warning(f"Failed to set ReconcileStatus for {tenant_id}: {e}")
+
+    # State was refreshed -> re-scan so the RESOURCE# inventory reconciles.
+    if succeeded and SCAN_QUEUE_URL:
+        try:
+            sqs.send_message(
+                QueueUrl=SCAN_QUEUE_URL,
+                MessageGroupId=tenant_id,
+                MessageBody=json.dumps({"tenant_id": tenant_id, "source": "reconcile"}),
+            )
+            logger.info(f"Reconcile complete for {tenant_id}; enqueued a scan.")
+        except ClientError as e:
+            logger.warning(f"Failed to enqueue post-reconcile scan for {tenant_id}: {e}")
 
 
 def _trigger_validation(tenant_id, finding_id, resource_id):
