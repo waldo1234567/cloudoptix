@@ -51,6 +51,10 @@ def lambda_handler(event, context):
             res_id = resource_data.get('SK', '').split('RESOURCE#')[-1]
             res_type = resource_data.get('ResourceType')
 
+            # Drifted resources are in state but no longer exist in AWS — nothing to remediate.
+            if resource_data.get('Status') == 'DRIFTED':
+                continue
+
             rule_result = evaluate_resource(resource_data)
 
             if rule_result.action == Action.IGNORE:

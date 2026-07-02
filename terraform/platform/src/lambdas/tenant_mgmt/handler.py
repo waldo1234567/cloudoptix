@@ -27,6 +27,7 @@ import json
 import uuid
 import logging
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 import boto3
 
@@ -41,7 +42,22 @@ CONFIG_BUCKET = os.environ['CONFIG_BUCKET']
 STATE_BUCKET = os.environ['STATE_BUCKET']
 PLATFORM_ACCOUNT_ID = os.environ.get('PLATFORM_ACCOUNT_ID', '')
 PLATFORM_REGION = os.environ.get('AWS_REGION', 'ap-northeast-1')
+CFN_TEMPLATE_URL = os.environ.get('CFN_TEMPLATE_URL', '')
 TENANT_ROLE_NAME = "CloudOptix-Tenant-Deployment-Role"
+
+
+def _launch_stack_url(region: str, external_id: str) -> str:
+    """CloudFormation console quick-create URL, pre-filled with the tenant's
+    external id + the platform account, so onboarding is one click."""
+    if not CFN_TEMPLATE_URL:
+        return ""
+    return (
+        f"https://{region}.console.aws.amazon.com/cloudformation/home?region={region}"
+        f"#/stacks/quickcreate?templateURL={quote(CFN_TEMPLATE_URL, safe='')}"
+        f"&stackName=CloudOptix-Onboarding"
+        f"&param_PlatformAccountID={PLATFORM_ACCOUNT_ID}"
+        f"&param_CloudOptixExternalID={external_id}"
+    )
 
 table = dynamodb.Table(TABLE_NAME)
 
@@ -50,7 +66,13 @@ def lambda_handler(event, context):
     # tenant_mgmt now handles registration only; Path B file upload lives in the
     # dedicated tf_upload lambda (POST /tenants/{id}/tf/upload).
     route_key = event.get('routeKey', '')
-    method = event.get('requestContext', {}).get('http', {}).get('method') or _method_from_route(route_key)
+    # Works under both HTTP API payload formats: 2.0 (requestContext.http.method),
+    # 1.0 (httpMethod), or falling back to the route key.
+    method = (
+        event.get('requestContext', {}).get('http', {}).get('method')
+        or event.get('httpMethod')
+        or _method_from_route(route_key)
+    )
 
     try:
         if method == 'POST':
@@ -66,7 +88,6 @@ def _register_tenant(event):
 
     account_id = body.get('account_id')
     region = body.get('region')
-    has_terraform = bool(body.get('has_terraform', False))
     tenant_name = body.get('tenant_name', '')
 
     if not account_id or not region:
@@ -75,10 +96,12 @@ def _register_tenant(event):
     tenant_id = str(uuid.uuid4())
     external_id = f"cloudoptix-{uuid.uuid4().hex[:16]}"
     tenant_role_arn = f"arn:aws:iam::{account_id}:role/{TENANT_ROLE_NAME}"
-    onboarding_path = "B" if has_terraform else "A"
     now = datetime.now(timezone.utc).isoformat()
 
-    # 1. Persist the tenant profile (schema consumed by scheduler/scanner/rules).
+    # Single onboarding path: the tenant brings their own Terraform + state.
+    # CloudOptix owns only the backend (injected by the buildspec at plan/apply)
+    # and a provider assume_role override added on upload. WorkspaceReady flips
+    # true once state is uploaded — nothing can plan/apply before then.
     table.put_item(Item={
         'PK': f"TENANT#{tenant_id}",
         'SK': 'PROFILE',
@@ -88,8 +111,8 @@ def _register_tenant(event):
         'TargetRegion': region,
         'TenantRoleArn': tenant_role_arn,
         'ExternalId': external_id,
-        'OnboardingPath': onboarding_path,
-        'HasTerraform': has_terraform,
+        'OnboardingPath': 'BYO_TF',
+        'WorkspaceReady': False,
         'ScanIntervalHours': 24,
         'ReevaluationIntervalHours': 168,
         'LastScanTime': None,
@@ -98,8 +121,9 @@ def _register_tenant(event):
         'CreatedAt': now,
     })
 
-    # 2. Scaffold the S3 Terraform workspace.
-    workspace_files = _scaffold_workspace(tenant_id, account_id, region, tenant_role_arn, external_id, onboarding_path)
+    # Scaffold: just the marker. The user's own .tf are the source of truth; the
+    # backend is buildspec-owned; the provider override is added by tf_upload.
+    workspace_files = _scaffold_workspace(tenant_id)
     for name, content in workspace_files.items():
         s3.put_object(
             Bucket=CONFIG_BUCKET,
@@ -110,7 +134,6 @@ def _register_tenant(event):
 
     return _response(201, {
         "tenant_id": tenant_id,
-        "onboarding_path": onboarding_path,
         "status": "ONBOARDING",
         "cross_account_role": {
             "role_name": TENANT_ROLE_NAME,
@@ -124,68 +147,22 @@ def _register_tenant(event):
                 "external_id, then it can be scanned and managed."
             ),
         },
-        "next_step": (
-            "Upload your Terraform files via POST /api/v1/tenants/{id}/tf/upload."
-            if onboarding_path == "B"
-            else "Trigger the first scan to auto-generate Terraform imports for your existing resources."
-        ),
+        "cloudformation": {
+            "template_url": CFN_TEMPLATE_URL,
+            "launch_stack_url": _launch_stack_url(region, external_id),
+        },
+        "next_step": "Grant cross-account access, then upload your Terraform files and state.",
         "workspace_files": list(workspace_files.keys()),
     })
 
 
-def _scaffold_workspace(tenant_id, account_id, region, tenant_role_arn, external_id, onboarding_path):
-    # Cross-account model: the CodeBuild backend runs as the platform role, and
-    # the provider assumes the tenant role for resource operations.
-    providers_tf = f'''provider "aws" {{
-  region = var.region
-
-  assume_role {{
-    role_arn    = "{tenant_role_arn}"
-    external_id = "{external_id}"
-  }}
-}}
-'''
-
-    variables_tf = f'''variable "region" {{
-  type    = string
-  default = "{region}"
-}}
-
-variable "account_id" {{
-  type    = string
-  default = "{account_id}"
-}}
-'''
-
-    backend_tf = f'''terraform {{
-  backend "s3" {{
-    bucket = "{STATE_BUCKET}"
-    key    = "{tenant_id}/terraform.tfstate"
-    region = "{PLATFORM_REGION}"
-  }}
-}}
-'''
-
+def _scaffold_workspace(tenant_id):
     marker_tf = f'''# This workspace is managed by CloudOptix.
-# Onboarding path: {onboarding_path}
 # Tenant: {tenant_id}
-# Do not edit generated files by hand; changes are reconciled on each scan.
+# CloudOptix owns the backend (injected at plan/apply) and adds a provider
+# assume_role override on upload. Your own .tf files are the source of truth.
 '''
-
-    files = {
-        "variables.tf": variables_tf,
-        "backend.tf": backend_tf,
-        "cloudoptix_managed.tf": marker_tf,
-    }
-
-    if onboarding_path == "A":
-        # Greenfield: own the provider and seed an empty main.tf the first scan fills.
-        files["providers.tf"] = providers_tf
-        files["main.tf"] = "# CloudOptix-managed resources will be generated here on first scan.\n"
-    # Path B: provider + main.tf come from the tenant via tf_upload, so we do not
-    # scaffold providers.tf here (it would collide with their provider block).
-
-    return files
+    return {"cloudoptix_managed.tf": marker_tf}
 
 
 def _method_from_route(route_key: str) -> str:

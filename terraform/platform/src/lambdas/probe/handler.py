@@ -310,9 +310,82 @@ def _l2_instance(clients, resource_id):
         ok, detail = _synthetic_http(dns)
         checks.append((ok, f"ALB {detail}"))
 
+    # East-west: can the instance still reach its databases (the classic private hop)?
+    checks.extend(_l2_instance_to_db(clients, resource_id, sg_ids, vpc_id))
+
     if not checks:
         return True, "no external ingress path to validate (private instance, no internet-facing ALB)"
     return all(c[0] for c in checks), "; ".join(c[1] for c in checks)
+
+
+# ── L2 east-west: EC2 -> RDS reachability (SG-inference driven) ─────────────────
+
+def _sg_allows_from(ec2, db_sg_ids, instance_sg_ids):
+    """True if any of the DB's SGs has an ingress rule referencing an instance SG."""
+    try:
+        sgs = ec2.describe_security_groups(GroupIds=db_sg_ids).get('SecurityGroups', [])
+    except ClientError:
+        return False
+    inst = set(instance_sg_ids)
+    for sg in sgs:
+        for perm in sg.get('IpPermissions', []):
+            if any(pair.get('GroupId') in inst for pair in perm.get('UserIdGroupPairs', [])):
+                return True
+    return False
+
+
+def _find_db_dependencies(clients, instance_sg_ids, vpc_id):
+    """RDS instances in the same VPC whose SG allows inbound from this instance's SG.
+
+    Returns [(db_id, db_sg_ids, port), ...]. This is probe-time inference: an SG rule
+    on the DB referencing the app's SG is the canonical "this app may reach this DB".
+    """
+    rds, ec2 = clients['rds'], clients['ec2']
+    deps = []
+    try:
+        dbs = rds.describe_db_instances().get('DBInstances', [])
+    except ClientError as e:
+        logger.warning(f"describe_db_instances failed: {e}")
+        return deps
+
+    for db in dbs:
+        if (db.get('DBSubnetGroup') or {}).get('VpcId') != vpc_id:
+            continue
+        if db.get('DBInstanceStatus') != 'available':
+            continue
+        db_sg_ids = [g['VpcSecurityGroupId'] for g in db.get('VpcSecurityGroups', [])
+                     if g.get('Status') == 'active']
+        port = (db.get('Endpoint') or {}).get('Port')
+        if db_sg_ids and port and _sg_allows_from(ec2, db_sg_ids, instance_sg_ids):
+            deps.append((db['DBInstanceIdentifier'], db_sg_ids, port))
+    return deps
+
+
+def _rds_enis(ec2, db_sg_ids):
+    """Resolve the RDS instance's network interface(s) — the reachability destination."""
+    try:
+        enis = ec2.describe_network_interfaces(
+            Filters=[{'Name': 'group-id', 'Values': db_sg_ids}]
+        ).get('NetworkInterfaces', [])
+    except ClientError:
+        return []
+    rds_managed = [e['NetworkInterfaceId'] for e in enis
+                   if (e.get('Description') or '').startswith('RDSNetworkInterface')]
+    return rds_managed or [e['NetworkInterfaceId'] for e in enis]
+
+
+def _l2_instance_to_db(clients, instance_id, instance_sg_ids, vpc_id):
+    """For each inferred DB dependency, prove instance -> RDS-ENI reachability on the DB port."""
+    ec2 = clients['ec2']
+    results = []
+    for db_id, db_sg_ids, port in _find_db_dependencies(clients, instance_sg_ids, vpc_id):
+        enis = _rds_enis(ec2, db_sg_ids)
+        if not enis:
+            results.append((True, f"instance->{db_id}: no RDS ENI resolved; skipped"))
+            continue
+        found, detail = _run_reachability(ec2, instance_id, enis[0], port, f"instance->{db_id}")
+        results.append((True if found is None else found, detail))  # a skip is non-fatal
+    return results
 
 
 def _validate(clients, resource_type, resource_id, finding):

@@ -19,7 +19,10 @@ def discover(tenant_id: str, account_id: str, region: str, role_arn: str, extern
     
     for page in paginator.paginate():
         for db in page.get('DBInstances', []):
-            
+            # A DB in 'deleting' is on its way out — treat as gone so drift is detected.
+            if db.get('DBInstanceStatus') == 'deleting':
+                continue
+
             arn = db['DBInstanceArn']
             db_id = db['DBInstanceIdentifier']
             

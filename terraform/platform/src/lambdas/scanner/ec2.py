@@ -22,6 +22,10 @@ def discover(tenant_id: str, account_id: str, region:str, role_arn:str, external
     for page in paginator.paginate():
         for reservation in page.get('Reservations', []):
             for instance in reservation.get('Instances', []):
+                # Terminated/shutting-down instances keep showing in describe_instances
+                # for ~1h after deletion. Treat them as gone so drift is detected.
+                if instance.get('State', {}).get('Name') in ('terminated', 'shutting-down'):
+                    continue
                 tags = {tag['Key']: tag['Value'] for tag in instance.get('Tags', [])}
                 instance_id = instance['InstanceId']
                 arn = f"arn:aws:ec2:{region}:{account_id}:instance/{instance_id}"
@@ -40,7 +44,7 @@ def discover(tenant_id: str, account_id: str, region:str, role_arn:str, external
                         "State": instance['State']['Name'],
                         "LaunchTime": instance['LaunchTime'].isoformat(),
                         "VpcId": instance.get('VpcId'),
-                        "SubnetId": instance.get('SubnetId')
+                        "SubnetId": instance.get('SubnetId'),
                         "ImageId": instance.get('ImageId'),
                         "SecurityGroups" : [
                             {"GroupId": sg['GroupId'], "GroupName": sg['GroupName']}

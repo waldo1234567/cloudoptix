@@ -41,14 +41,19 @@ phases:
 
   build:
     commands:
-      - echo "Generating terraform plan..."
-      - terraform plan -no-color -out=tfplan
       - |
-        if [ "${APPLY}" = "true" ]; then
-          echo "APPLY=true -> executing terraform apply"
-          terraform apply -no-color -auto-approve tfplan
+        if [ "${REFRESH_ONLY}" = "true" ]; then
+          echo "REFRESH_ONLY=true -> syncing state to real infrastructure (no resource changes)"
+          terraform apply -refresh-only -no-color -auto-approve
         else
-          echo "APPLY=false -> plan preview only. No changes applied."
+          echo "Generating terraform plan..."
+          terraform plan -no-color -out=tfplan
+          if [ "${APPLY}" = "true" ]; then
+            echo "APPLY=true -> executing terraform apply"
+            terraform apply -no-color -auto-approve tfplan
+          else
+            echo "APPLY=false -> plan preview only. No changes applied."
+          fi
         fi
 
   post_build:

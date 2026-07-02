@@ -35,32 +35,20 @@ PLATFORM_ACCOUNT_ID = os.environ.get('PLATFORM_ACCOUNT_ID', '')
 
 table = dynamodb.Table(TABLE_NAME)  # type: ignore
 
-# Patterns that indicate the tenant already has a remote backend we must not override.
+# Any backend declaration conflicts with the CloudOptix-owned backend the
+# buildspec injects, so we reject all of them (s3, remote, local, cloud, ...).
 EXISTING_BACKEND_PATTERNS = [
-    re.compile(r'backend\s+"s3"\s*\{'),
-    re.compile(r'backend\s+"remote"\s*\{'),
-    re.compile(r'backend\s+"cloud"\s*\{'),
+    re.compile(r'backend\s+"[^"]+"\s*\{'),
     re.compile(r'^\s*cloud\s*\{', re.MULTILINE),  # Terraform Cloud's newer `cloud {}` block
 ]
 PROVIDER_AWS_PATTERN = re.compile(r'provider\s+"aws"\s*\{')
 ASSUME_ROLE_PATTERN = re.compile(r'assume_role\s*\{')
 
+# Files CloudOptix owns; a user upload must never overwrite them.
+RESERVED_FILENAMES = {'backend.tf', 'cloudoptix_managed.tf', 'cloudoptix_provider.tf'}
 
-# ── Backend / provider templates (match the buildspec + tenant_mgmt conventions) ──
 
-def _backend_tf(tenant_id: str, region: str) -> str:
-    # Matches what buildspec.yml regenerates at apply time (single workspace state,
-    # bucket-default encryption, no separate lock table).
-    return f"""terraform {{
-  backend "s3" {{
-    bucket  = "{STATE_BUCKET}"
-    key     = "{tenant_id}/terraform.tfstate"
-    region  = "{region}"
-    encrypt = true
-  }}
-}}
-"""
-
+# ── Provider template (backend is owned by the buildspec, injected at plan/apply) ──
 
 def _providers_tf_with_assume_role(role_arn: str, external_id: str, region: str) -> str:
     """Provider used when the tenant uploaded no provider "aws" block at all.
@@ -163,14 +151,20 @@ def _handle_tf_upload(tenant_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
     if not files:
         return _error(400, "No Terraform files provided.")
 
-    # Guard: do not silently take over an existing remote backend.
+    # State is required: without it, terraform plan would try to CREATE resources
+    # that already exist. This is the hard gate that makes remediation safe.
+    if not tfstate:
+        return _error(400,
+            "Terraform state is required. Remove any backend block from your config, run "
+            "'terraform state pull > terraform.tfstate', and upload that file via the tfstate field."
+        )
+
+    # Guard: reject any backend declaration — CloudOptix owns the backend.
     if _has_existing_backend(files):
         return _error(409,
-            "Your Terraform configuration already declares a remote backend "
-            "(s3 / remote / cloud). CloudOptix cannot safely inject its own backend "
-            "without risking state conflicts. Please export your state instead: "
-            "run 'terraform state pull > terraform.tfstate' and upload that file "
-            "via the tfstate field, removing the backend block from your config."
+            "Your Terraform configuration declares its own backend. CloudOptix manages the "
+            "backend for you, so remove the backend block, export your state with "
+            "'terraform state pull > terraform.tfstate', and upload that state file."
         )
 
     provider_file = _find_provider_aws_file(files)
@@ -185,11 +179,15 @@ def _handle_tf_upload(tenant_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
         if not path or content is None:
             return _error(400, "Each file requires 'path' and 'content'.")
 
+        safe_path = path.lstrip('/').replace('..', '')  # guard against prefix escape
+        base = safe_path.split('/')[-1]
+        if base in RESERVED_FILENAMES or base.startswith('cloudoptix_'):
+            return _error(400, f"'{base}' is a reserved CloudOptix filename — rename that file and re-upload.")
+
         if inject_assume and provider_file and path == provider_file['path']:
             content = _inject_assume_role_block(content, role_arn, external_id)
             logger.info(f"Injected assume_role into {path} for tenant {tenant_id}.")
 
-        safe_path = path.lstrip('/').replace('..', '')  # guard against prefix escape
         s3.put_object(
             Bucket=CONFIG_BUCKET,
             Key=f"{tenant_id}/{safe_path}",
@@ -197,59 +195,41 @@ def _handle_tf_upload(tenant_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
         )
         stored_files.append(safe_path)
 
-    # No provider "aws" block anywhere — add one that assumes the tenant role.
+    # No provider "aws" block anywhere — add a namespaced one that assumes the tenant role.
     if not provider_file:
         s3.put_object(
             Bucket=CONFIG_BUCKET,
-            Key=f"{tenant_id}/providers.tf",
+            Key=f"{tenant_id}/cloudoptix_provider.tf",
             Body=_providers_tf_with_assume_role(role_arn, external_id, region).encode('utf-8'),
         )
-        stored_files.append("providers.tf")
-        logger.info(f"No provider \"aws\" block found — added providers.tf for tenant {tenant_id}.")
+        stored_files.append("cloudoptix_provider.tf")
+        logger.info(f"No provider \"aws\" block found — added cloudoptix_provider.tf for tenant {tenant_id}.")
 
-    # CloudOptix-owned backend (safe: we confirmed no existing backend above).
+    # The tenant's state seeds the STATEADDR# map via the state_parser S3 trigger.
     s3.put_object(
-        Bucket=CONFIG_BUCKET,
-        Key=f"{tenant_id}/backend.tf",
-        Body=_backend_tf(tenant_id, region).encode('utf-8'),
+        Bucket=STATE_BUCKET,
+        Key=f"{tenant_id}/terraform.tfstate",
+        Body=tfstate.encode('utf-8') if isinstance(tfstate, str) else json.dumps(tfstate).encode('utf-8'),
     )
-    stored_files.append("backend.tf")
-
-    # Optional: tenant also provided a tfstate export -> seeds the STATEADDR# map
-    # via the state_parser S3 trigger.
-    state_status = "not provided"
-    if tfstate:
-        s3.put_object(
-            Bucket=STATE_BUCKET,
-            Key=f"{tenant_id}/terraform.tfstate",
-            Body=tfstate.encode('utf-8') if isinstance(tfstate, str) else json.dumps(tfstate).encode('utf-8'),
-        )
-        state_status = "provided — state_parser will populate the STATEADDR# map automatically"
 
     table.update_item(
         Key={'PK': f"TENANT#{tenant_id}", 'SK': "PROFILE"},
-        UpdateExpression="SET OnboardingPath = :p, WorkspaceReady = :r, #status = :s, UpdatedAt = :ts",
+        UpdateExpression="SET WorkspaceReady = :r, #status = :s, UpdatedAt = :ts",
         ExpressionAttributeNames={'#status': 'Status'},
         ExpressionAttributeValues={
-            ':p': 'B',
-            ':r': bool(tfstate),  # address resolution only reliable once we have state
-            ':s': 'TF_UPLOADED',
+            ':r': True,
+            ':s': 'READY',
             ':ts': datetime.now(timezone.utc).isoformat(),
         },
     )
 
-    logger.info(f"Path B upload complete for tenant {tenant_id}. Files: {stored_files}")
+    logger.info(f"Upload complete for tenant {tenant_id}. Files: {stored_files}")
 
     return _ok(200, {
         "tenant_id": tenant_id,
         "files_stored": stored_files,
-        "tfstate_status": state_status,
-        "next_step": (
-            "Trigger a scan to begin generating recommendations."
-            if tfstate
-            else "Run 'terraform state pull > terraform.tfstate' locally and upload it via the "
-                 "tfstate field so CloudOptix can resolve resource addresses, or trigger a scan."
-        ),
+        "tfstate_status": "provided — state_parser will populate the STATEADDR# map automatically",
+        "next_step": "Trigger a scan to begin generating recommendations.",
     })
 
 

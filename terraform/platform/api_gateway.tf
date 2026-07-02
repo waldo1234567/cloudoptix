@@ -1,5 +1,5 @@
 resource "aws_apigatewayv2_api" "http_api" {
-  name = "cloudoptix-http-api"
+  name          = "cloudoptix-http-api"
   protocol_type = "HTTP"
   cors_configuration {
     allow_origins = ["*"]
@@ -15,15 +15,15 @@ resource "aws_apigatewayv2_stage" "default_stage" {
 }
 
 resource "aws_apigatewayv2_authorizer" "cognito_jwt" {
-  api_id = aws_apigatewayv2_api.http_api.id
-  authorizer_type = "JWT"
+  api_id           = aws_apigatewayv2_api.http_api.id
+  authorizer_type  = "JWT"
   identity_sources = ["$request.header.Authorization"]
-  name = "cognito-authorizer"
+  name             = "cognito-authorizer"
 
-    jwt_configuration {
-      audience = [aws_cognito_user_pool_client.frontend_client.id]
-      issuer = "https://cognito-idp.${var.aws_region}.amazonaws.com/${aws_cognito_user_pool.tenant_pool.id}"
-    }
+  jwt_configuration {
+    audience = [aws_cognito_user_pool_client.frontend_client.id]
+    issuer   = "https://cognito-idp.${var.aws_region}.amazonaws.com/${aws_cognito_user_pool.tenant_pool.id}"
+  }
 }
 
 resource "aws_apigatewayv2_integration" "recommendations_integration" {
@@ -72,6 +72,196 @@ resource "aws_lambda_permission" "apigw_approve" {
   source_arn    = "${aws_apigatewayv2_api.http_api.execution_arn}/*/*/api/v1/tenants/*/recommendations/*/approve"
 }
 
+
+resource "aws_apigatewayv2_integration" "workspace_integration" {
+  api_id             = aws_apigatewayv2_api.http_api.id
+  integration_type   = "AWS_PROXY"
+  integration_uri    = aws_lambda_function.api_workspace.invoke_arn
+  integration_method = "POST"
+}
+
+resource "aws_apigatewayv2_route" "workspace_list_route" {
+  api_id    = aws_apigatewayv2_api.http_api.id
+  route_key = "GET /api/v1/tenants/{id}/workspace"
+
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito_jwt.id
+  target             = "integrations/${aws_apigatewayv2_integration.workspace_integration.id}"
+}
+
+resource "aws_apigatewayv2_route" "workspace_file_route" {
+  api_id    = aws_apigatewayv2_api.http_api.id
+  route_key = "GET /api/v1/tenants/{id}/workspace/{file}"
+
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito_jwt.id
+  target             = "integrations/${aws_apigatewayv2_integration.workspace_integration.id}"
+}
+
+resource "aws_lambda_permission" "apigw_workspace" {
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.api_workspace.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.http_api.execution_arn}/*/*/api/v1/tenants/*/workspace"
+}
+
+resource "aws_lambda_permission" "apigw_workspace_file" {
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.api_workspace.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.http_api.execution_arn}/*/*/api/v1/tenants/*/workspace/*"
+}
+
+resource "aws_apigatewayv2_integration" "finding_status_integration" {
+  api_id             = aws_apigatewayv2_api.http_api.id
+  integration_type   = "AWS_PROXY"
+  integration_uri    = aws_lambda_function.api_finding_status.invoke_arn
+  integration_method = "POST"
+}
+
+resource "aws_apigatewayv2_route" "finding_status_route" {
+  api_id    = aws_apigatewayv2_api.http_api.id
+  route_key = "GET /api/v1/tenants/{id}/findings/{rec_id}/status"
+
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito_jwt.id
+  target             = "integrations/${aws_apigatewayv2_integration.finding_status_integration.id}"
+}
+
+resource "aws_lambda_permission" "apigw_finding_status" {
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.api_finding_status.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.http_api.execution_arn}/*/*/api/v1/tenants/*/findings/*/status"
+}
+
+resource "aws_apigatewayv2_integration" "delete_integration" {
+  api_id             = aws_apigatewayv2_api.http_api.id
+  integration_type   = "AWS_PROXY"
+  integration_uri    = aws_lambda_function.api_delete.invoke_arn
+  integration_method = "POST"
+}
+
+resource "aws_apigatewayv2_route" "delete_tenant_route" {
+  api_id             = aws_apigatewayv2_api.http_api.id
+  route_key          = "DELETE /api/v1/tenants/{id}"
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito_jwt.id
+  target             = "integrations/${aws_apigatewayv2_integration.delete_integration.id}"
+}
+
+resource "aws_apigatewayv2_route" "delete_finding_route" {
+  api_id             = aws_apigatewayv2_api.http_api.id
+  route_key          = "DELETE /api/v1/tenants/{id}/recommendations/{rec_id}"
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito_jwt.id
+  target             = "integrations/${aws_apigatewayv2_integration.delete_integration.id}"
+}
+
+resource "aws_apigatewayv2_route" "delete_resource_route" {
+  api_id             = aws_apigatewayv2_api.http_api.id
+  route_key          = "DELETE /api/v1/tenants/{id}/resources"
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito_jwt.id
+  target             = "integrations/${aws_apigatewayv2_integration.delete_integration.id}"
+}
+
+resource "aws_lambda_permission" "apigw_delete" {
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.api_delete.function_name
+  principal     = "apigateway.amazonaws.com"
+  # Covers the three DELETE routes at different path depths.
+  source_arn = "${aws_apigatewayv2_api.http_api.execution_arn}/*/*"
+}
+
+resource "aws_apigatewayv2_integration" "reconcile_integration" {
+  api_id             = aws_apigatewayv2_api.http_api.id
+  integration_type   = "AWS_PROXY"
+  integration_uri    = aws_lambda_function.api_reconcile.invoke_arn
+  integration_method = "POST"
+}
+
+resource "aws_apigatewayv2_route" "reconcile_route" {
+  api_id             = aws_apigatewayv2_api.http_api.id
+  route_key          = "POST /api/v1/tenants/{id}/reconcile"
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito_jwt.id
+  target             = "integrations/${aws_apigatewayv2_integration.reconcile_integration.id}"
+}
+
+resource "aws_lambda_permission" "apigw_reconcile" {
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.api_reconcile.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.http_api.execution_arn}/*/*/api/v1/tenants/*/reconcile"
+}
+
+resource "aws_apigatewayv2_integration" "scan_integration" {
+  api_id             = aws_apigatewayv2_api.http_api.id
+  integration_type   = "AWS_PROXY"
+  integration_uri    = aws_lambda_function.api_scan.invoke_arn
+  integration_method = "POST"
+}
+
+resource "aws_apigatewayv2_route" "scan_route" {
+  api_id             = aws_apigatewayv2_api.http_api.id
+  route_key          = "POST /api/v1/tenants/{id}/scan"
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito_jwt.id
+  target             = "integrations/${aws_apigatewayv2_integration.scan_integration.id}"
+}
+
+resource "aws_lambda_permission" "apigw_scan" {
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.api_scan.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.http_api.execution_arn}/*/*/api/v1/tenants/*/scan"
+}
+
+resource "aws_apigatewayv2_integration" "resources_integration" {
+  api_id             = aws_apigatewayv2_api.http_api.id
+  integration_type   = "AWS_PROXY"
+  integration_uri    = aws_lambda_function.api_resources.invoke_arn
+  integration_method = "POST"
+}
+
+resource "aws_apigatewayv2_route" "resources_route" {
+  api_id             = aws_apigatewayv2_api.http_api.id
+  route_key          = "GET /api/v1/tenants/{id}/resources"
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito_jwt.id
+  target             = "integrations/${aws_apigatewayv2_integration.resources_integration.id}"
+}
+
+resource "aws_lambda_permission" "apigw_resources" {
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.api_resources.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.http_api.execution_arn}/*/*/api/v1/tenants/*/resources"
+}
+
+resource "aws_apigatewayv2_integration" "verify_access_integration" {
+  api_id             = aws_apigatewayv2_api.http_api.id
+  integration_type   = "AWS_PROXY"
+  integration_uri    = aws_lambda_function.api_verify_access.invoke_arn
+  integration_method = "POST"
+}
+
+resource "aws_apigatewayv2_route" "verify_access_route" {
+  api_id    = aws_apigatewayv2_api.http_api.id
+  route_key = "POST /api/v1/tenants/{id}/verify-access"
+
+  authorization_type = "JWT"
+  authorizer_id      = aws_apigatewayv2_authorizer.cognito_jwt.id
+  target             = "integrations/${aws_apigatewayv2_integration.verify_access_integration.id}"
+}
+
+resource "aws_lambda_permission" "apigw_verify_access" {
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.api_verify_access.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.http_api.execution_arn}/*/*/api/v1/tenants/*/verify-access"
+}
 
 resource "aws_apigatewayv2_integration" "tenant_mgmt_integration" {
   api_id             = aws_apigatewayv2_api.http_api.id

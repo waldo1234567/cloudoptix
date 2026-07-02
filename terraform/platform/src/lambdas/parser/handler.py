@@ -21,6 +21,7 @@ from urllib.parse import unquote_plus
 from datetime import datetime, timezone
 
 import boto3
+from boto3.dynamodb.conditions import Key
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -29,6 +30,22 @@ s3 = boto3.client('s3')
 dynamodb = boto3.resource('dynamodb')
 TABLE_NAME = os.environ.get('DYNAMODB_TABLE_NAME', 'cloudoptix-core-table')
 table = dynamodb.Table(TABLE_NAME)  # type: ignore
+
+
+def _existing_state_ids(tenant_id: str) -> set:
+    ids = set()
+    kwargs = {
+        'KeyConditionExpression': Key('PK').eq(f"TENANT#{tenant_id}") & Key('SK').begins_with("STATEADDR#"),
+        'ProjectionExpression': 'SK',
+    }
+    while True:
+        resp = table.query(**kwargs)
+        for it in resp.get('Items', []):
+            ids.add(str(it.get('SK', '')).split('STATEADDR#', 1)[-1])
+        if 'LastEvaluatedKey' not in resp:
+            break
+        kwargs['ExclusiveStartKey'] = resp['LastEvaluatedKey']
+    return ids
 
 
 def _format_address(res_type: str, res_name: str, index_key) -> str:
@@ -91,8 +108,10 @@ def lambda_handler(event, context):
 
         now = datetime.now(timezone.utc).isoformat()
 
+        new_ids = set()
         with table.batch_writer() as batch:
             for aws_id, address, res_type in _extract_mappings(state):
+                new_ids.add(aws_id)
                 batch.put_item(Item={
                     'PK': f"TENANT#{tenant_id}",
                     'SK': f"STATEADDR#{aws_id}",
@@ -102,6 +121,15 @@ def lambda_handler(event, context):
                     'UpdatedAt': now,
                 })
                 written += 1
+
+        # Reconcile: the state file is authoritative, so drop STATEADDR# entries
+        # for resources no longer in it (destroyed, or removed by refresh-only).
+        stale = _existing_state_ids(tenant_id) - new_ids
+        if stale:
+            with table.batch_writer() as batch:
+                for aws_id in stale:
+                    batch.delete_item(Key={'PK': f"TENANT#{tenant_id}", 'SK': f"STATEADDR#{aws_id}"})
+            logger.info(f"Reconciled state map for {tenant_id}: removed {len(stale)} stale address(es).")
 
         logger.info(f"Mapped {written} resource addresses for tenant {tenant_id}.")
 

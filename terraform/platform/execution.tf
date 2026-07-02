@@ -80,7 +80,7 @@ resource "aws_iam_role_policy" "api_lambda_permissions" {
     Version = "2012-10-17"
     Statement = [
       {
-        Action = ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:BatchGetItem", "dynamodb:Query", "dynamodb:UpdateItem"]
+        Action = ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:BatchGetItem", "dynamodb:Query", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:BatchWriteItem"]
         Effect = "Allow"
         Resource = [
           aws_dynamodb_table.recommendations.arn,
@@ -94,11 +94,29 @@ resource "aws_iam_role_policy" "api_lambda_permissions" {
         Resource = aws_codebuild_project.terraform_runner.arn
       },
       {
-        Action = ["s3:PutObject", "s3:GetObject"]
+        Action   = "sts:AssumeRole"
+        Effect   = "Allow"
+        Resource = "arn:aws:iam::*:role/CloudOptix-Tenant-Deployment-Role"
+      },
+      {
+        Action   = "sqs:SendMessage"
+        Effect   = "Allow"
+        Resource = aws_sqs_queue.scan_queue.arn
+      },
+      {
+        Action = ["s3:PutObject", "s3:GetObject", "s3:GetObjectVersion", "s3:DeleteObject", "s3:DeleteObjectVersion"]
         Effect = "Allow"
         Resource = [
           "${aws_s3_bucket.tenant_configs.arn}/*",
           "${aws_s3_bucket.tenant_tfstate.arn}/*"
+        ]
+      },
+      {
+        Action = ["s3:ListBucket", "s3:ListBucketVersions"]
+        Effect = "Allow"
+        Resource = [
+          aws_s3_bucket.tenant_configs.arn,
+          aws_s3_bucket.tenant_tfstate.arn
         ]
       },
       {
@@ -153,6 +171,40 @@ resource "aws_lambda_function" "api_approve" {
   }
 }
 
+resource "aws_lambda_function" "api_workspace" {
+  filename         = data.archive_file.backend_zip.output_path
+  source_code_hash = data.archive_file.backend_zip.output_base64sha256
+
+  function_name = "CloudOptix-API-Workspace"
+  role          = aws_iam_role.api_lambda_role.arn
+  handler       = "lambdas.api.workspace.lambda_handler"
+  runtime       = "python3.11"
+  timeout       = 30
+
+  environment {
+    variables = {
+      CONFIG_BUCKET = aws_s3_bucket.tenant_configs.bucket
+    }
+  }
+}
+
+resource "aws_lambda_function" "api_finding_status" {
+  filename         = data.archive_file.backend_zip.output_path
+  source_code_hash = data.archive_file.backend_zip.output_base64sha256
+
+  function_name = "CloudOptix-API-Finding-Status"
+  role          = aws_iam_role.api_lambda_role.arn
+  handler       = "lambdas.api.finding_status.lambda_handler"
+  runtime       = "python3.11"
+  timeout       = 30
+
+  environment {
+    variables = {
+      DYNAMODB_TABLE_NAME = aws_dynamodb_table.cloudoptix_table.name
+    }
+  }
+}
+
 
 resource "aws_lambda_function" "tenant_mgmt" {
   filename         = data.archive_file.backend_zip.output_path
@@ -170,6 +222,98 @@ resource "aws_lambda_function" "tenant_mgmt" {
       CONFIG_BUCKET       = aws_s3_bucket.tenant_configs.bucket
       STATE_BUCKET        = aws_s3_bucket.tenant_tfstate.bucket
       PLATFORM_ACCOUNT_ID = data.aws_caller_identity.current.account_id
+      CFN_TEMPLATE_URL    = local.tenant_role_template_url
+    }
+  }
+}
+
+resource "aws_lambda_function" "api_reconcile" {
+  filename         = data.archive_file.backend_zip.output_path
+  source_code_hash = data.archive_file.backend_zip.output_base64sha256
+
+  function_name = "CloudOptix-API-Reconcile"
+  role          = aws_iam_role.api_lambda_role.arn
+  handler       = "lambdas.api.reconcile.lambda_handler"
+  runtime       = "python3.11"
+  timeout       = 30
+
+  environment {
+    variables = {
+      DYNAMODB_TABLE_NAME    = aws_dynamodb_table.cloudoptix_table.name
+      CONFIG_BUCKET          = aws_s3_bucket.tenant_configs.bucket
+      STATE_BUCKET           = aws_s3_bucket.tenant_tfstate.bucket
+      CODEBUILD_PROJECT_NAME = aws_codebuild_project.terraform_runner.name
+    }
+  }
+}
+
+resource "aws_lambda_function" "api_delete" {
+  filename         = data.archive_file.backend_zip.output_path
+  source_code_hash = data.archive_file.backend_zip.output_base64sha256
+
+  function_name = "CloudOptix-API-Delete"
+  role          = aws_iam_role.api_lambda_role.arn
+  handler       = "lambdas.api.delete.lambda_handler"
+  runtime       = "python3.11"
+  timeout       = 60
+
+  environment {
+    variables = {
+      DYNAMODB_TABLE_NAME = aws_dynamodb_table.cloudoptix_table.name
+      CONFIG_BUCKET       = aws_s3_bucket.tenant_configs.bucket
+      STATE_BUCKET        = aws_s3_bucket.tenant_tfstate.bucket
+    }
+  }
+}
+
+resource "aws_lambda_function" "api_scan" {
+  filename         = data.archive_file.backend_zip.output_path
+  source_code_hash = data.archive_file.backend_zip.output_base64sha256
+
+  function_name = "CloudOptix-API-Scan"
+  role          = aws_iam_role.api_lambda_role.arn
+  handler       = "lambdas.api.scan.lambda_handler"
+  runtime       = "python3.11"
+  timeout       = 30
+
+  environment {
+    variables = {
+      DYNAMODB_TABLE_NAME = aws_dynamodb_table.cloudoptix_table.name
+      SCAN_QUEUE_URL      = aws_sqs_queue.scan_queue.url
+    }
+  }
+}
+
+resource "aws_lambda_function" "api_resources" {
+  filename         = data.archive_file.backend_zip.output_path
+  source_code_hash = data.archive_file.backend_zip.output_base64sha256
+
+  function_name = "CloudOptix-API-Resources"
+  role          = aws_iam_role.api_lambda_role.arn
+  handler       = "lambdas.api.resources.lambda_handler"
+  runtime       = "python3.11"
+  timeout       = 30
+
+  environment {
+    variables = {
+      DYNAMODB_TABLE_NAME = aws_dynamodb_table.cloudoptix_table.name
+    }
+  }
+}
+
+resource "aws_lambda_function" "api_verify_access" {
+  filename         = data.archive_file.backend_zip.output_path
+  source_code_hash = data.archive_file.backend_zip.output_base64sha256
+
+  function_name = "CloudOptix-API-Verify-Access"
+  role          = aws_iam_role.api_lambda_role.arn
+  handler       = "lambdas.api.verify_access.lambda_handler"
+  runtime       = "python3.11"
+  timeout       = 30
+
+  environment {
+    variables = {
+      DYNAMODB_TABLE_NAME = aws_dynamodb_table.cloudoptix_table.name
     }
   }
 }
